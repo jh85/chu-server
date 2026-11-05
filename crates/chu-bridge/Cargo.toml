@@ -1,0 +1,4 @@
+[package]
+name = "chu-bridge"
+version.workspace = true
+edition.workspace = true

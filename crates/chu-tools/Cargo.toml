@@ -1,0 +1,4 @@
+[package]
+name = "chu-tools"
+version.workspace = true
+edition.workspace = true

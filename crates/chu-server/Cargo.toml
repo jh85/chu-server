@@ -1,0 +1,4 @@
+[package]
+name = "chu-server"
+version.workspace = true
+edition.workspace = true

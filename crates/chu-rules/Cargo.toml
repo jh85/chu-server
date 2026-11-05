@@ -1,0 +1,11 @@
+[package]
+name = "chu-rules"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["ffi"]
+ffi = []
+
+[build-dependencies]
+cc.workspace = true

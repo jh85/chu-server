@@ -1,0 +1,4 @@
+[package]
+name = "chu-proto"
+version.workspace = true
+edition.workspace = true

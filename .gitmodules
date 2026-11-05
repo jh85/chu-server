@@ -1,0 +1,3 @@
+[submodule "vendor/chushogi"]
+	path = vendor/chushogi
+	url = https://github.com/jh85/chushogi.git
