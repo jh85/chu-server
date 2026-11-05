@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use chu_proto::{valid_name, ClientMsg, IDLE_TIMEOUT_S, LINES_PER_SEC, LINE_BURST, MAX_LINE};
+use chu_proto::{valid_name, ClientMsg, LineBucket, IDLE_TIMEOUT_S, MAX_LINE};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Instant};
@@ -155,8 +155,7 @@ impl Session {
 async fn read_loop<R: AsyncRead + Unpin>(rd: R, tx: mpsc::Sender<Input>) {
     let mut rd = BufReader::new(rd);
     let mut buf = Vec::new();
-    // Token bucket (§1): LINE_BURST lines, refilled at LINES_PER_SEC.
-    let mut bucket = (Instant::now(), f64::from(LINE_BURST));
+    let mut bucket = LineBucket::server(Instant::now().into_std());
     loop {
         buf.clear();
         // Read one line, refusing to buffer more than MAX_LINE bytes.
@@ -185,13 +184,10 @@ async fn read_loop<R: AsyncRead + Unpin>(rd: R, tx: mpsc::Sender<Input>) {
             let _ = tx.send(Input::Violation("line over 1 KiB")).await;
             return;
         }
-        let refill = now.duration_since(bucket.0).as_secs_f64() * f64::from(LINES_PER_SEC);
-        bucket = (now, (bucket.1 + refill).min(f64::from(LINE_BURST)));
-        if bucket.1 < 1.0 {
+        if !bucket.try_take(now.into_std()) {
             let _ = tx.send(Input::Violation("line rate limit")).await;
             return;
         }
-        bucket.1 -= 1.0;
         if buf.last() == Some(&b'\r') {
             buf.pop();
         }

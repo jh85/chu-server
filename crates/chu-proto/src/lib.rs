@@ -2,9 +2,12 @@
 //! server messages, game names, and the Game_Summary block. Shared by the
 //! server and the bridge; no I/O here.
 
+mod bucket;
+pub mod clock;
 mod game_name;
 mod summary;
 
+pub use bucket::LineBucket;
 pub use game_name::GameName;
 pub use summary::{GameSummary, PlayedMove, SummaryError, TimeConfig, TimeUnit};
 

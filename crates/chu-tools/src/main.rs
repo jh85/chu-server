@@ -5,9 +5,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use chu_proto::{ClientMsg, ColorReq, GameSummary, ServerMsg, Side};
+use chu_proto::{ClientMsg, ColorReq, GameSummary, LineBucket, ServerMsg, Side};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -68,40 +68,16 @@ impl Gen {
     }
 }
 
-/// The server's line bucket (SERVER-PROTOCOL.md §1) mirrored on the sending
-/// side with a margin: a random player is far faster than 100 lines/s, so it
-/// waits only when the bucket would run dry.
-struct Bucket {
-    tokens: f64,
-    at: Instant,
-}
-
-impl Bucket {
-    const CAP: f64 = chu_proto::LINE_BURST as f64 * 0.9;
-    const RATE: f64 = chu_proto::LINES_PER_SEC as f64 * 0.9;
-
-    fn take(&mut self) {
-        let now = Instant::now();
-        self.tokens = (self.tokens + now.duration_since(self.at).as_secs_f64() * Self::RATE).min(Self::CAP);
-        self.at = now;
-        if self.tokens < 1.0 {
-            std::thread::sleep(Duration::from_secs_f64((1.0 - self.tokens) / Self::RATE));
-            self.tokens = 1.0;
-            self.at = Instant::now();
-        }
-        self.tokens -= 1.0;
-    }
-}
-
 struct Client {
     rd: BufReader<TcpStream>,
     wr: TcpStream,
-    bucket: Bucket,
+    /// A random player is far faster than the server's line limit.
+    bucket: LineBucket,
 }
 
 impl Client {
     fn send(&mut self, line: &str) -> Res<()> {
-        self.bucket.take();
+        std::thread::sleep(self.bucket.wait(Instant::now()));
         writeln!(self.wr, "{line}")?;
         Ok(())
     }
@@ -128,8 +104,7 @@ fn play(server: &str, name: &str, password: &str, game: &str, color: &str, games
     }
     let sock = TcpStream::connect(server)?;
     sock.set_nodelay(true)?;
-    let bucket = Bucket { tokens: Bucket::CAP, at: Instant::now() };
-    let mut c = Client { rd: BufReader::new(sock.try_clone()?), wr: sock, bucket };
+    let mut c = Client { rd: BufReader::new(sock.try_clone()?), wr: sock, bucket: LineBucket::client(Instant::now()) };
     c.send(&ClientMsg::Login { name: name.into(), password: password.into(), x1: true }.to_string())?;
     match ServerMsg::parse(&c.recv()?) {
         ServerMsg::LoginOk(_) => {}

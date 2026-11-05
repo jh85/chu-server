@@ -34,6 +34,7 @@ async fn server(test: &str) -> TestServer {
     tokio::spawn(async move {
         loop {
             let (sock, _) = listener.accept().await.unwrap();
+            sock.set_nodelay(true).unwrap();
             s.serve(sock);
         }
     });

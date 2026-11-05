@@ -1,7 +1,6 @@
 //! The chu shogi tournament server: sessions, lobby, game actors, clocks,
 //! storage. `main.rs` only parses flags and calls [`Server::start`].
 
-pub mod clock;
 pub mod game;
 pub mod lobby;
 pub mod session;
@@ -14,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
-pub use chu_proto::Side;
+pub use chu_proto::{clock, Side};
 
 /// What a connection's writer task receives.
 #[derive(Debug)]

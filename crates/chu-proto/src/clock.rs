@@ -4,7 +4,7 @@
 //! afterwards `remaining -= max(0, charged - byoyomi)` and `remaining += increment`.
 //! Byoyomi leagues have `increment = 0`, Fischer leagues `byoyomi = 0`.
 
-use chu_proto::{GameName, TimeConfig, TimeUnit};
+use crate::{GameName, TimeConfig, TimeUnit};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimeControl {
@@ -23,6 +23,18 @@ impl TimeControl {
             (name.byoyomi_s * 1000, 0)
         };
         TimeControl { unit, total_ms: name.total_s * 1000, byoyomi_ms, increment_ms, least_ms: 0 }
+    }
+
+    /// The clock a client reads from a Game_Summary's `BEGIN Time` block.
+    pub fn from_summary(t: &TimeConfig) -> TimeControl {
+        let u = t.time_unit.ms();
+        TimeControl {
+            unit: t.time_unit,
+            total_ms: t.total_time * u,
+            byoyomi_ms: t.byoyomi * u,
+            increment_ms: t.increment * u,
+            least_ms: t.least_time_per_move * u,
+        }
     }
 
     /// The `BEGIN Time` block, in `unit`.
@@ -78,6 +90,7 @@ mod tests {
         assert_eq!(t.units(t.charged_ms(2_310)), 2_310);
         let s = t.summary();
         assert_eq!((s.total_time, s.byoyomi, s.increment), (60_000, 0, 1000));
+        assert_eq!(TimeControl::from_summary(&s), t);
     }
 
     #[test]
@@ -97,5 +110,6 @@ mod tests {
         assert_eq!(t.charged_ms(2_999), 2_000);
         assert_eq!(t.units(2_000), 2);
         assert_eq!(t.summary().total_time, 600);
+        assert_eq!(TimeControl::from_summary(&t.summary()), t);
     }
 }
