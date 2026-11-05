@@ -334,12 +334,16 @@ async fn disconnect_and_resume() {
     // A stale disconnect from an older connection is ignored later on.
     h.play_one_sided(S, "8h8g").await;
 
+    sleep(Duration::from_millis(5_250)).await; // gote's clock runs while away
+
     let (conn, out) = Conn::new(3);
     let (ctl, _ctl_rx) = unbounded_channel();
     h.out[1] = out;
     h.tx.send(GameInput::Reattach { side: G, conn, ctl }).unwrap();
     let sum = h.summary(G).await;
     assert_eq!(sum.your_turn, G);
+    // 60 s + 1 s Fischer: sente moved twice, gote once and is on the clock.
+    assert_eq!(sum.time.remaining, Some([62_000, 61_000 - 5_250]));
     assert_eq!(sum.to_move, G, "To_Move gives the side to move after the MOVES lines");
     let moves: Vec<_> = sum.moves.iter().map(|m| (m.side, m.usi.as_str())).collect();
     assert_eq!(moves, [(S, "8i8h"), (G, "6c5e"), (S, "8h8g")]);

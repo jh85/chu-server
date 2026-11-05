@@ -214,6 +214,7 @@ impl Bridge<'_> {
                 _ => {}
             }
         }
+        let summary_at = Instant::now();
         let summary = GameSummary::parse(&lines).map_err(|e| Stop::Fatal(format!("bad Game_Summary: {e}")))?;
 
         let resumed = match self.track.take() {
@@ -239,7 +240,7 @@ impl Bridge<'_> {
             self.engine.send("usinewgame").await?;
         }
         match agree(srv).await {
-            Ok(true) => self.play(srv, summary, resumed).await,
+            Ok(true) => self.play(srv, summary, summary_at, resumed).await,
             Ok(false) => {
                 if resumed.is_none() {
                     self.engine.send("gameover draw").await?;
@@ -254,7 +255,13 @@ impl Bridge<'_> {
         }
     }
 
-    async fn play(&mut self, srv: &mut Server, summary: GameSummary, resumed: Option<Track>) -> Step<()> {
+    async fn play(
+        &mut self,
+        srv: &mut Server,
+        summary: GameSummary,
+        summary_at: Instant,
+        resumed: Option<Track>,
+    ) -> Step<()> {
         let id = summary.game_id.clone();
         let me = summary.your_turn;
         let tc = TimeControl::from_summary(&summary.time);
@@ -266,12 +273,18 @@ impl Bridge<'_> {
             moves.push(m.usi.clone());
         }
         let mut to_move = summary.to_move;
-        // A resumed turn began before the reconnect: at the last echo we saw,
-        // or, if the opponent moved while we were away, no earlier than the drop.
-        let mut turn_start = match &resumed {
-            Some(t) if t.plies == moves.len() => t.turn_start,
-            Some(t) => t.dropped_at,
-            None => Instant::now(),
+        let mut turn_start = match (&resumed, summary.time.remaining) {
+            // A resumed game's clocks as the server sent them (§4), the side
+            // to move charged up to the summary.
+            (Some(_), Some(r)) => {
+                rem = r.map(|units| units * unit);
+                summary_at
+            }
+            // Without them: the turn began at the last echo we saw, or, if the
+            // opponent moved while we were away, no earlier than the drop.
+            (Some(t), None) if t.plies == moves.len() => t.turn_start,
+            (Some(t), None) => t.dropped_at,
+            (None, _) => Instant::now(),
         };
         info!(game = %id, side = %me.sign(), resumed = resumed.is_some(), plies = moves.len(), "game started");
 

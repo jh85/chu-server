@@ -25,7 +25,8 @@ impl TimeControl {
         TimeControl { unit, total_ms: name.total_s * 1000, byoyomi_ms, increment_ms, least_ms: 0 }
     }
 
-    /// The clock a client reads from a Game_Summary's `BEGIN Time` block.
+    /// The clock a client reads from a Game_Summary's `BEGIN Time` block
+    /// (`Remaining±` aside).
     pub fn from_summary(t: &TimeConfig) -> TimeControl {
         let u = t.time_unit.ms();
         TimeControl {
@@ -46,6 +47,7 @@ impl TimeControl {
             byoyomi: self.byoyomi_ms / u,
             increment: self.increment_ms / u,
             least_time_per_move: self.least_ms / u,
+            remaining: None,
         }
     }
 

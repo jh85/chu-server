@@ -180,6 +180,19 @@ impl Game {
         }
     }
 
+    /// A resumed game's summary (§4): the moves so far and both clocks now,
+    /// the side to move charged for its turn so far.
+    fn send_resume_summary(&self, side: Side) {
+        let mut sum = self.summary(side);
+        let mut rem = self.remaining_ms;
+        let used = self.turn_start.elapsed().as_millis() as u64;
+        rem[idx(self.to_move)] = rem[idx(self.to_move)].saturating_sub(used);
+        sum.time.remaining = Some(rem.map(|ms| self.tc.units(ms)));
+        for line in sum.to_lines() {
+            self.send(side, &line);
+        }
+    }
+
     /// The lobby hears first, so a %%GAME sent after the result lines is
     /// never handled while the lobby still thinks the player is busy.
     fn release_lobby(&self) {
@@ -313,7 +326,7 @@ impl Game {
                     p.conn = Some(conn);
                     p.ctl = Some(ctl);
                     self.resuming[idx(side)] = true;
-                    self.send_summary(side);
+                    self.send_resume_summary(side);
                 }
                 GameInput::Monitor { .. } | GameInput::Show { .. } => unreachable!(),
             }

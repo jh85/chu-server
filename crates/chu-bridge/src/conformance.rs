@@ -121,12 +121,12 @@ pub async fn run(mut engine: Engine, options: &[(String, String)]) -> Res<bool> 
     let mut reported = None;
     let until = Instant::now() + Duration::from_secs(1);
     while let Some(l) = engine.recv_within(until.saturating_duration_since(Instant::now())).await? {
-        if l.starts_with("info string") {
+        if l.starts_with("info string error") {
             reported = Some(l);
             break;
         }
     }
-    rep.check("position after gameover without usinewgame is reported", reported.is_some(), reported.unwrap_or_default());
+    rep.check("position after gameover without usinewgame: info string error", reported.is_some(), reported.unwrap_or_default());
 
     // A short game against itself: every bestmove legal, every id echoed.
     engine.send("usinewgame").await?;

@@ -34,6 +34,9 @@ pub struct TimeConfig {
     pub byoyomi: u64,
     pub increment: u64,
     pub least_time_per_move: u64,
+    /// `Remaining+:` and `Remaining-:`, sente first: the clocks when a
+    /// resumed game's summary was sent (§4). None in a new game's summary.
+    pub remaining: Option<[u64; 2]>,
 }
 
 /// `+8i8h,T2310`: a move with the time it used, in the game's time unit.
@@ -128,10 +131,12 @@ impl GameSummary {
             format!("Byoyomi:{}", t.byoyomi),
             format!("Increment:{}", t.increment),
             format!("Least_Time_Per_Move:{}", t.least_time_per_move),
-            "END Time".to_owned(),
-            "BEGIN Position".to_owned(),
-            format!("SFEN:{}", self.sfen),
         ];
+        if let Some([plus, minus]) = t.remaining {
+            v.push(format!("Remaining+:{plus}"));
+            v.push(format!("Remaining-:{minus}"));
+        }
+        v.extend(["END Time".to_owned(), "BEGIN Position".to_owned(), format!("SFEN:{}", self.sfen)]);
         v.extend(self.moves.iter().map(|m| format!("MOVES:{m}")));
         v.push("END Position".to_owned());
         v.push("END Game_Summary".to_owned());
@@ -198,6 +203,12 @@ impl GameSummary {
             "NO" => false,
             v => return Err(err(&format!("Rematch_On_Draw:{v}"))),
         };
+        let has = |k: &str| kv.iter().any(|(k2, _)| *k2 == k);
+        let remaining = match (has("Remaining+"), has("Remaining-")) {
+            (true, true) => Some([num("Remaining+")?, num("Remaining-")?]),
+            (false, false) => None,
+            _ => return Err(err("Remaining+ and Remaining- come together")),
+        };
         Ok(GameSummary {
             protocol_version: get("Protocol_Version")?.to_owned(),
             protocol_mode: get("Protocol_Mode")?.to_owned(),
@@ -216,6 +227,7 @@ impl GameSummary {
                 byoyomi: num("Byoyomi")?,
                 increment: num("Increment")?,
                 least_time_per_move: num("Least_Time_Per_Move")?,
+                remaining,
             },
             sfen: get("SFEN")?.to_owned(),
             moves,

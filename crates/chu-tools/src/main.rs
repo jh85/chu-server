@@ -1,5 +1,8 @@
-//! chu-tools: command-line tools for the chu-server. Phase 1 has `play`, a
-//! test client that plays `chushogi-gen go random` over the server protocol.
+//! chu-tools: command-line tools for the chu-server. `play` is a test client
+//! that plays `chushogi-gen go random` over the server protocol;
+//! `conformance --client` checks a client against SERVER-PROTOCOL.md §7.
+
+mod conformance;
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -38,6 +41,19 @@ enum Cmd {
         seed: Option<u64>,
         #[arg(long, default_value = chu_rules::BUILT_CHUSHOGI_GEN)]
         gen: PathBuf,
+    },
+    /// Check a client against a scripted server (SERVER-PROTOCOL.md §7).
+    Conformance {
+        /// Shell command starting the client; `{server}` becomes the scripted
+        /// server's address. The client must play at least 3 games.
+        #[arg(long)]
+        client: String,
+        /// Where the client's stderr goes (default: discarded).
+        #[arg(long)]
+        client_log: Option<PathBuf>,
+        /// Seed for the scripted opponent's moves.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
     },
 }
 
@@ -191,6 +207,12 @@ fn main() -> Res<()> {
     match Cli::parse().cmd {
         Cmd::Play { server, name, password, game, color, games, seed, gen } => {
             play(&server, &name, &password, &game, &color, games, seed, &gen)
+        }
+        Cmd::Conformance { client, client_log, seed } => {
+            if !conformance::run(&client, client_log.as_deref(), seed)? {
+                std::process::exit(1);
+            }
+            Ok(())
         }
     }
 }
