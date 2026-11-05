@@ -1,15 +1,17 @@
 # Chu-Server Protocol 1.0 — client ↔ tournament server
 
-Status: draft, 2026-11-04. Derived from CSA Server Protocol 1.2.1 (shogi-server / floodgate); the session
+Status: draft 2, 2026-11-05. Derived from CSA Server Protocol 1.2.1 (shogi-server / floodgate); the session
 grammar is CSA's, the game content is USI-Chu (see `USI-CHU.md`). Reference implementation: `chu-server`;
 reference client: `chu-bridge`. "MUST / SHOULD / MAY" as in RFC 2119.
 
 ## 1. Transport
 
-- TCP, UTF-8, lines end with `\n`. One message per line. Lines over 1 KiB or more than 100 lines/s from one
-  connection → the server closes it (`#CHUDAN` for a game in progress).
+- TCP, UTF-8, lines end with `\n`. One message per line. Timestamps anywhere in the protocol are UTC.
+- Limits per connection: 1 KiB per line; a token bucket of 500 lines refilled at 100 lines/s. Exceeding either
+  is a protocol violation: `#ILLEGAL_ACTION` (a loss) if a game is in progress, then the connection is closed.
 - An empty line is a keep-alive. A connection silent for 600 s outside a game is closed.
-- Messages beginning with `%%` are lobby commands, `%` are game commands, `#` are server results, `+`/`-` are moves.
+- Messages beginning with `%%` are lobby commands, `%` are game commands, `#` are server results, `+`/`-` are moves,
+  `##[…]` are server notices (`##[ERROR] <text>` for a rejected lobby command).
 
 ## 2. Login
 
@@ -27,7 +29,7 @@ is mandatory. A second login with the same name closes the first connection.
 
 | Command | Reply |
 | --- | --- |
-| `%%GAME <game-name> <+\|-\|*>` | Queue for a game. `*` = either colour (floodgate leagues); `+`/`-` = sente/gote in challenge leagues. |
+| `%%GAME <game-name> <+\|-\|*>` | Queue for a game. `*` = either colour; `+`/`-` = sente/gote (challenge leagues only; `*` is accepted there too). |
 | `%%GAME <game-name> * <sfen>` | Only in `chu-test-*` leagues: start from a given SFEN, unrated. |
 | `%%WHO`, `%%LIST`, `%%SHOW <game-id>` | Player list, game list, moves of a game, each terminated by `##[…] +OK`. |
 | `%%MONITORON <game-id>` / `%%MONITOROFF <game-id>` | Receive / stop receiving a game's moves as `##[MONITOR][<game-id>] <line>`. |
@@ -67,9 +69,10 @@ Leagues named `floodgate` pair on the server's schedule; other leagues pair as s
 < START:<game-id>
 ```
 
+- `Game_ID` is `<game-name>+<sente>+<gote>+<UTC yyyymmddhhmmss>`, with `-2`, `-3`, … appended when two games start in the same second.
 - `Rules:` is `lishogi` or `jcsa`. `Time_Unit:` is `1msec` or `1sec` per league; all time fields use it.
-- `REJECT`, or no answer within 30 s, cancels the game; both players return to the lobby.
-- A resumed game adds `MOVES:<move>,T<n>` lines after `SFEN:`, one per move already played; `To_Move:` gives the side to move.
+- `REJECT`, or no answer within 30 s, cancels the game: both players receive `REJECT:<game-id> by <name>` and return to the lobby.
+- A resumed game adds `MOVES:<move>,T<n>` lines after `SFEN:`, one per move already played; `To_Move:` is the side to move after them.
 
 ## 5. Moves and results
 
@@ -79,35 +82,38 @@ Leagues named `floodgate` pair on the server's schedule; other leagues pair as s
 > %TORYO                resign
 ```
 
-- A move is `<colour><usi-move>` with `+` = sente, `-` = gote. Wrong colour, wrong turn, or not in the referee's
-  legal list ends the game with `#ILLEGAL_MOVE`.
-- The server's clock is the authority: time used is measured from the server's echo of the previous move to its
-  receipt of this one. Byoyomi: a move within `Byoyomi` costs nothing from `Total_Time`. Fischer: `Increment` is added after the move.
+- A move is `<colour><usi-move>` with `+` = sente, `-` = gote, spelled exactly as the referee's legal list spells it
+  (so `8i8h=` is illegal). Wrong colour, wrong turn, or not legal ends the game with `#ILLEGAL_MOVE`.
+- Every accepted move is echoed, including a game-ending one; the result lines follow the echo.
+- The server's clock is the authority: time used is measured from the moment the server queued the echo of the
+  previous move to its receipt of this one. Byoyomi: a move within `Byoyomi` costs nothing from `Total_Time`.
+  Fischer: `Increment` is added after the move.
 
 Every game ends with one reason line, then one verdict line (`#WIN`, `#LOSE`, `#DRAW`, `#CENSORED` = void) to each player:
 
 | Reason | Verdict | Trigger |
 | --- | --- | --- |
 | `#RESIGN` | opponent wins | `%TORYO` |
-| `#TIME_UP` | opponent wins | clock exhausted (server time) |
+| `#TIME_UP` | opponent wins | clock exhausted (server time), including while disconnected |
 | `#ILLEGAL_MOVE` | opponent wins | see above |
+| `#ILLEGAL_ACTION` | opponent wins | protocol violation: line/rate limits, command out of place |
 | `#ROYALS_LOST` | mover wins | last enemy royal captured |
-| `#BARE_KING` | mover wins | bare-king rule under the game's `Rules:` |
+| `#BARE_KING` | winner per `Rules:` | bare-king rule; either side can be the winner |
 | `#STALEMATE` | mover wins | side to move has no legal move |
 | `#INSUFFICIENT` | draw | only two royals remain |
 | `#SENNICHITE` | draw | same position (board, side, lion-capture field) for the 4th time |
-| `#OUTE_SENNICHITE` | checking side loses | fourfold repetition with perpetual check |
-| `#MAX_MOVES` | draw | ply 1000 reached |
-| `#CHUDAN` | void, `#CENSORED` | disconnect not recovered in time, server shutdown, protocol violation |
+| `#OUTE_SENNICHITE` | checking side loses | fourfold repetition with perpetual check (both rule sets) |
+| `#MAX_MOVES` | draw | ply 1000 reached; rated |
+| `#CHUDAN` | void, `#CENSORED` | server shutdown without recovery, or referee failure; never a player's fault |
 
 After the verdict the players are back in the lobby and MAY send `%%GAME` again.
 
 ## 6. Disconnect and resume
 
-A player whose connection drops during a game may reconnect (`LOGIN`, then `%%GAME` with the same game name)
-while its clock still has time; it receives the Game_Summary with `MOVES:` and answers `AGREE`. Its clock keeps
-running meanwhile. If the time runs out, `#TIME_UP`; if the server cannot keep the game (restart without
-recovery), `#CHUDAN`.
+A player whose connection drops during a game keeps its clock running. It may reconnect (`LOGIN`, then
+`%%GAME` with the same game name) while time remains and receives the Game_Summary with `MOVES:`; it answers
+`AGREE` and play continues. If its clock reaches zero first, the game ends with `#TIME_UP` and is rated.
+`#CHUDAN` is reserved for causes on the server side.
 
 ## 7. Conformance
 

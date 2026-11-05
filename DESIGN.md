@@ -1,6 +1,6 @@
 # Chu Shogi Tournament Server: Design and Implementation Plan
 
-Nov 4, 2026 · @eii
+Nov 4, 2026, updated Nov 5, 2026 · Eii
 
 ## Goals and scope
 
@@ -40,19 +40,30 @@ int      chu_set_sfen(chu_pos*, const char* sfen);        /* 0 ok, <0 parse erro
 int      chu_set_rules(chu_pos*, int rules);              /* 0 lishogi, 1 jcsa */
 int      chu_move(chu_pos*, const char* usi);             /* 0 ok, -1 illegal, -2 bad syntax */
 int      chu_legal(const chu_pos*, char* buf, int cap);   /* space-separated USI moves, returns count */
-int      chu_status(const chu_pos*);                      /* playing/royalslost/bareking/stalemate/draw */
+int      chu_status(const chu_pos*, int* winner);         /* playing/royalslost/bareking/stalemate/draw; winner out-param */
 int      chu_in_check(const chu_pos*, int side);          /* for perpetual-check detection */
 int      chu_sfen(const chu_pos*, char* buf, int cap);
 int      chu_ply(const chu_pos*);
 ```
 
-No exceptions cross the boundary, no C++ types, every buffer is caller-owned. `chu_in_check` is the only new engine logic; the rest wraps functions that already exist.
+No exceptions cross the boundary, no C++ types, every buffer is caller-owned. Every function wraps logic that already exists in the engine (`chu_in_check` wraps `inCheck`). `chu_move` accepts only the exact spelling `chu_legal` prints. Implemented on the `capi` branch of jh85/chushogi (Nov 2026).
 
 ## System architecture
 
 One Rust binary does everything: it listens on the game port, runs the scheduler, hosts the games and serves the web pages. The C++ referee is linked in as a static library, and the AlphaZero agents never see the server protocol because a bridge speaks USI to them.
 
-&#91;embedded content: chu-server architecture: 3 clients, 4 server layers, referee and storage\]
+```
+chushogi-az / any USI engine --USI--> chu-bridge --TCP--> Protocol layer (sessions)
+Browser --HTTP--> Web (axum)                            |
+                                                        v
+                               Lobby and floodgate scheduler
+                                                        |
+                                                        v
+                               Game actor (one task per game) --> chu-rules (FFI to libchushogi.a)
+                                   |                             --> Storage (SQLite, kifu files)
+                                   v  live events
+                               Web (axum): pages, SSE live board, downloads
+```
 
 Moves flow top to bottom: a session parses the line, the lobby decides who plays whom, the game task owns the clocks and asks `chu-rules` whether each move is legal and whether the game is over, and every state change is pushed to the web layer for the live board and written to storage.
 
@@ -148,13 +159,13 @@ Result reason lines (`#` messages) follow CSA where the meaning matches and add 
 | `#TIME_UP` | opponent | Clock reached zero, judged on server receive time |
 | `#ILLEGAL_MOVE` | opponent | Move not in the referee's legal list, or wrong colour prefix, or sent out of turn |
 | `#ROYALS_LOST` | mover | Last enemy royal captured (`status royalslost`) |
-| `#BARE_KING` | mover | Referee reports `bareking` under the game's rule set |
+| `#BARE_KING` | mover | Referee reports `bareking` under the game's rule set and names the winner, since either side can be the bared one |
 | `#STALEMATE` | mover | Side to move has no legal move (a loss in chu shogi) |
 | `#INSUFFICIENT` | draw | Referee reports `draw` (two royals only) |
 | `#SENNICHITE` | draw | Same SFEN (board, side, lion-capture field) for the 4th time |
 | `#OUTE_SENNICHITE` | opponent | Fourfold repetition where every move of one side in the cycle gave check (perpetual check loses, as on lishogi); needs `chu_in_check` |
-| `#MAX_MOVES` | draw | Ply 1000 reached (`#CENSORED` to both, as floodgate does) |
-| `#CHUDAN` | none | Opponent disconnected or server shutdown; game is void and unrated |
+| `#MAX_MOVES` | draw | Ply 1000 reached; a rated draw (lishogi's rule), not floodgate's void `#CENSORED` |
+| `#CHUDAN` | none | Server shutdown without recovery or referee failure only; a disconnected player's clock keeps running and it loses on `#TIME_UP`. Protocol violations (line or rate limits, commands out of place) are `#ILLEGAL_ACTION`, a loss for the violator |
 
 Every `#` outcome is computed once in the game actor and sent to both players, every monitor, the record writer and the rating queue from the same event, so the four never disagree.
 
@@ -170,7 +181,7 @@ Move handling in the game actor, per received line:
 4. Push the new SFEN (without the move number) onto the repetition map; on the 4th occurrence end with `#SENNICHITE`, or `#OUTE_SENNICHITE` against the side that gave check on every one of its moves since the first occurrence.
 5. Ask `chu-rules` for status; `royalslost`, `bareking`, `stalemate`, `draw` end the game with the matching reason line.
 6. If the ply count has reached 1000, end with `#MAX_MOVES`.
-7. Otherwise echo `+move,T<sec>` to both players and all monitors, start the opponent's clock, and append to the record.
+7. Echo `+move,T<ms>` to both players and all monitors (every accepted move is echoed, a game-ending one before its result lines), start the opponent's clock from the moment the echo is queued, and append to the record.
 
 Clocks are integers in the league's `Time_Unit`, `1msec` by default (CSA 1.2.1 allows it; `1sec` stays available per league), measured with `tokio::time::Instant` from the moment the previous echo was written to the socket. Milliseconds matter at fast leagues such as 60+1, where whole-second rounding would charge a 0.9 s move zero or one second at random, a systematic bias between engines with different move-time distributions. Two modes, selected by the game name: byoyomi (`Total_Time` then `Byoyomi` per move; a move within byoyomi costs nothing from the main clock) and Fischer (`Increment` added after each move, `Byoyomi:0`). Each clock has a timer task; a timer firing with no move received ends the game with `#TIME_UP`, so a hung engine cannot stall a round.
 
@@ -178,7 +189,7 @@ Rule set is a property of the league (`-jcsa` suffix) and is sent as `Rules:` in
 
 Start position is the standard chu shogi setup for every rated game. A `chu-test-…` league accepts `%%GAME` with an SFEN argument for engine testing; those games are unrated and never appear in standings.
 
-Disconnects: a player whose socket closes mid-game loses on `#CHUDAN` only if it does not reconnect within the time left on its clock; a reconnect (same LOGIN, then `%%GAME` with the same name) is attached to the running game and receives the Game\_Summary with `MOVES:` so far. This matches floodgate's practice of letting engines survive a network blip without rewarding a stall, and it is what the AlphaZero workers will need when an inference server restarts.
+Disconnects: a player whose socket closes mid-game keeps its clock running and loses on `#TIME_UP` if it does not reconnect before the clock expires; a reconnect (same LOGIN, then `%%GAME` with the same name) is attached to the running game and receives the Game\_Summary with `MOVES:` so far. This matches floodgate's practice of letting engines survive a network blip without rewarding a stall, and it is what the AlphaZero workers will need when an inference server restarts.
 
 ## Floodgate scheduling, pairing and rating
 
@@ -205,8 +216,8 @@ One SQLite file (WAL mode, via `sqlx`) holds accounts, games and ratings; game r
 | Table | Columns | Purpose |
 | --- | --- | --- |
 | `players` | name, password\_hash (argon2), created\_at, banned, alias\_of | Accounts; `alias_of` groups engine versions on the web page |
-| `games` | id, league, rules, sente, gote, started\_at, ended\_at, result (`+`/`-`/`=`/void), reason, ply\_count, final\_sfen, record\_path | One row per game, written at start and updated once at the end |
-| `moves` | game\_id, ply, usi, elapsed\_s, sfen\_after | Enables replay, live resume after restart, and position queries for research |
+| `games` | id, league, rules, sente, gote, started\_at, ended\_at, result (`+`/`-`/`=`/void), reason, ply\_count, initial\_sfen, final\_sfen, record\_path | One row per game, written at start and updated once at the end |
+| `moves` | game\_id, ply, usi, elapsed\_ms, sfen\_after | Enables replay, live resume after restart, and position queries for research |
 | `ratings` | league, player, rating, games, computed\_at | Current rating per league |
 | `rating_history` | league, player, rating, computed\_at | One row per recompute, for curves |
 | `rounds` | league, scheduled\_at, paired\_json | Audit trail of who was paired and who sat out |
@@ -260,9 +271,14 @@ Two small additions make `chushogi-az` a conformant engine: respond to `usi`/`is
 
 Six phases, each ending in a gate that is a test you can run, not a judgement; the referee binding comes first because every later phase's test leans on it. Phases 0 to 3 give a working rated league; 4 and 5 make it something other people can watch and that survives a reboot.
 
-&#91;embedded content: implementation roadmap · 6 phases, each with its exit gate\]
-
-Dashed boxes are exit gates; the solid accent marks the phase that delivers rated floodgate play.
+| Phase | Exit gate |
+| --- | --- |
+| 0 Referee binding | FFI perft matches chushogi-gen on all 289 fixture positions |
+| 1 Protocol and game actor | 100 random-vs-random games; every record passes replay_test.py |
+| 2 USI bridge | az vs random, 20 timed games, no bridge-caused time losses |
+| 3 Floodgate scheduler and rating | 4 bots, 48 h unattended; ratings order the bots correctly |
+| 4 Web front end | live game followed from a phone; moves and clocks update without reload |
+| 5 Hardening and deployment | kill -9 mid-round; games resume, nothing lost |
 
 **Phase 0: Referee binding** (in jh85/chushogi and the new `chu-server` repo)
 
@@ -322,6 +338,10 @@ Decisions that change code in phase 0 or 1 and are worth settling before startin
 - [x] Time unit: milliseconds by default, per league.
 - [x] Repo: new `chu-server` repo, chushogi as a pinned submodule.
 
+Settled on 5 Nov 2026 after the phase-1 report: disconnects keep the clock running and end in `#TIME_UP` (`#CHUDAN` only for server-side causes); `#MAX_MOVES` is a rated draw; perpetual check is a loss under both rule sets until the JCSA text says otherwise; protocol violations are `#ILLEGAL_ACTION`.
+
+Status 5 Nov 2026: phases 0 and 1 done and both gates pass (commits 5686e86, e0fb11b; submodule branch `capi` at 33c3575, to be pushed and tagged). Phase-1 gate: 100 games at chu-test-60-1F, 32,053 positions, all records pass `replay_test.py`, results agree with `random_match.py`. The replay test compares recorded SFENs only when `CHU_REPLAY_GAMES` points at the lishogi game directory, which is not on the server machine.
+
 Risks and how the plan contains them:
 
 | Risk | Effect | Containment |
@@ -329,7 +349,7 @@ Risks and how the plan contains them:
 | FFI boundary bug (exception, lifetime, buffer size) crashes the whole server | All games in progress lost | `capi.cpp` catches every exception and returns a code; buffers are caller-sized with a documented maximum (legal list of 500 moves at 10 chars); the subprocess backend remains available per league as a fallback |
 | Repetition rule disagrees with lishogi | Rated results differ from the lishogi records you test against | Replay the lishogi games that ended in `repetition` through the game actor in phase 1 and require the same ply and outcome |
 | Scheduler and clocks drift under load | Rounds start late, engines lose on time unfairly | Clocks are measured per game from socket write/receive; the scheduler is a separate task; `/metrics` reports referee and echo latency so a slow host shows up before engines complain |
-| An engine floods the connection | Server CPU spent on parsing | Per-connection line length cap (1 KiB) and a 100 lines/s limit, then disconnect with `#CHUDAN` |
+| An engine floods the connection | Server CPU spent on parsing | Per-connection line length cap (1 KiB) and a token bucket of 500 lines refilled at 100/s (a plain 100/s cap was tripped by the random players in the phase-1 gate), then `#ILLEGAL_ACTION` and disconnect |
 | Rating fit unstable with few games | Early standings look random | Provisional ratings until 15 games, mean-1500 anchoring, and a random bot as a permanent floor the way floodgate relies on known engines |
 | Two rule sets drift apart in the engine | A JCSA league quietly plays lishogi rules | `Rules:` is echoed in Game\_Summary and stored per game; `jcsa_test.py` runs in the Rust CI through the FFI |
 
