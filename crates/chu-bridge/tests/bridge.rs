@@ -18,6 +18,7 @@ async fn start_server(dir: &std::path::Path) -> std::net::SocketAddr {
         referee: Backend::Ffi,
         db_url: format!("sqlite://{}", dir.join("chu.db").display()),
         records_dir: dir.join("records"),
+        leagues: vec![],
     };
     let server = Server::start(cfg).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

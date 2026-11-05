@@ -1,8 +1,11 @@
 //! chu-tools: command-line tools for the chu-server. `play` is a test client
 //! that plays `chushogi-gen go random` over the server protocol;
-//! `conformance --client` checks a client against SERVER-PROTOCOL.md §7.
+//! `conformance --client` checks a client against SERVER-PROTOCOL.md §7;
+//! `rate` refits the ratings from the games table and compares them with the
+//! server's.
 
 mod conformance;
+mod rate;
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -54,6 +57,15 @@ enum Cmd {
         /// Seed for the scripted opponent's moves.
         #[arg(long, default_value_t = 1)]
         seed: u64,
+    },
+    /// Refit every league's ratings from the games table, print them, and
+    /// fail unless they equal the server's `ratings` table.
+    Rate {
+        #[arg(long, default_value = "sqlite://chu.db")]
+        db: String,
+        /// Only this league (default: every league with rated games).
+        #[arg(long)]
+        league: Option<String>,
     },
 }
 
@@ -207,6 +219,12 @@ fn main() -> Res<()> {
     match Cli::parse().cmd {
         Cmd::Play { server, name, password, game, color, games, seed, gen } => {
             play(&server, &name, &password, &game, &color, games, seed, &gen)
+        }
+        Cmd::Rate { db, league } => {
+            if !rate::run(&db, league.as_deref())? {
+                std::process::exit(1);
+            }
+            Ok(())
         }
         Cmd::Conformance { client, client_log, seed } => {
             if !conformance::run(&client, client_log.as_deref(), seed)? {

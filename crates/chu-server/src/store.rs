@@ -1,10 +1,13 @@
 //! The single writer for SQLite and the record files.
 //!
-//! Game actors and sessions send messages; the store task applies them in
-//! order. Records go to `records/<game-name>/<yyyy>/<mm>/<dd>/<game-id>/` in
+//! Game actors, sessions and the lobby send messages; the store task applies
+//! them in order. After every rated game it refits the league's ratings
+//! (`rating.rs`), writes them and a history row per player, and publishes
+//! them to the lobby on a watch channel. Records go to `records/<game-name>/<yyyy>/<mm>/<dd>/<game-id>/` in
 //! the layout of vendor/chushogi/tools/random_match.py (moves.usi,
 //! positions.sfen, positions.tsv, record.json) plus game.csa.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::SystemTime;
@@ -15,9 +18,10 @@ use chu_proto::{Reason, Side};
 use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info};
 
+use crate::rating::{self, Rating};
 use crate::util::Utc;
 
 const SCHEMA: &str = "
@@ -41,7 +45,8 @@ CREATE TABLE IF NOT EXISTS games (
   reason TEXT,
   ply_count INTEGER NOT NULL DEFAULT 0,
   final_sfen TEXT,
-  record_path TEXT
+  record_path TEXT,
+  rated INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS moves (
   game_id TEXT NOT NULL REFERENCES games(id),
@@ -51,7 +56,48 @@ CREATE TABLE IF NOT EXISTS moves (
   sfen_after TEXT NOT NULL,
   PRIMARY KEY (game_id, ply)
 );
+CREATE TABLE IF NOT EXISTS ratings (
+  league TEXT NOT NULL,
+  player TEXT NOT NULL,
+  rating REAL NOT NULL,
+  games INTEGER NOT NULL,
+  computed_at TEXT NOT NULL,
+  PRIMARY KEY (league, player)
+);
+CREATE TABLE IF NOT EXISTS rating_history (
+  league TEXT NOT NULL,
+  player TEXT NOT NULL,
+  rating REAL NOT NULL,
+  games INTEGER NOT NULL,
+  computed_at TEXT NOT NULL,
+  after_game TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS rating_history_player ON rating_history (league, player);
+CREATE TABLE IF NOT EXISTS rounds (
+  league TEXT NOT NULL,
+  scheduled_at TEXT NOT NULL,
+  fired_at TEXT NOT NULL,
+  pool_json TEXT NOT NULL,
+  paired_json TEXT NOT NULL,
+  sat_out TEXT,
+  PRIMARY KEY (league, scheduled_at)
+);
 ";
+
+/// Current ratings: league → player → rating.
+pub type Standings = HashMap<String, HashMap<String, Rating>>;
+
+/// One floodgate round as paired, for the `rounds` audit table.
+#[derive(Debug, Clone)]
+pub struct RoundRecord {
+    pub league: String,
+    pub scheduled_at: SystemTime,
+    pub fired_at: SystemTime,
+    pub pool: Vec<String>,
+    /// (sente, gote, game id)
+    pub pairs: Vec<(String, String, String)>,
+    pub sat_out: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct StartedGame {
@@ -92,6 +138,7 @@ pub enum StoreMsg {
     Started(StartedGame),
     Move { game_id: String, ply: u32, mv: RecordedMove },
     Finished(Box<FinishedGame>),
+    Round(RoundRecord),
     /// Replies once every earlier message has been applied.
     Sync(oneshot::Sender<()>),
 }
@@ -122,23 +169,87 @@ pub async fn open(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
     // is per connection.
     let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await?;
     sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+    // Databases from before phase 3 lack games.rated.
+    let cols: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info('games')").fetch_all(&pool).await?;
+    if !cols.iter().any(|c| c.0 == "rated") {
+        sqlx::query("ALTER TABLE games ADD COLUMN rated INTEGER NOT NULL DEFAULT 0").execute(&pool).await?;
+    }
     Ok(pool)
 }
 
-pub async fn spawn(db_url: &str, records_dir: PathBuf) -> Result<StoreTx, sqlx::Error> {
+/// The `ratings` table as stored.
+pub async fn load_standings(pool: &SqlitePool) -> Result<Standings, sqlx::Error> {
+    let rows: Vec<(String, String, f64, i64)> =
+        sqlx::query_as("SELECT league, player, rating, games FROM ratings").fetch_all(pool).await?;
+    let mut st = Standings::new();
+    for (league, player, rating, games) in rows {
+        st.entry(league).or_default().insert(player.clone(), Rating { player, rating, games: games as u32 });
+    }
+    Ok(st)
+}
+
+pub async fn spawn(db_url: &str, records_dir: PathBuf) -> Result<(StoreTx, watch::Receiver<Standings>), sqlx::Error> {
     let pool = open(db_url).await?;
+    let (standings, standings_rx) = watch::channel(load_standings(&pool).await?);
     let (tx, mut rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if let Err(e) = apply(&pool, &records_dir, msg).await {
+            if let Err(e) = apply(&pool, &records_dir, &standings, msg).await {
                 error!("store: {e}");
             }
         }
     });
-    Ok(tx)
+    Ok((tx, standings_rx))
 }
 
-async fn apply(pool: &SqlitePool, records_dir: &Path, msg: StoreMsg) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// Refits a league from the games table and replaces its `ratings` rows.
+async fn rerate(
+    pool: &SqlitePool,
+    standings: &watch::Sender<Standings>,
+    league: &str,
+    after_game: &str,
+) -> Result<(), sqlx::Error> {
+    let games = rating::league_games(pool, league).await?;
+    let fitted = rating::fit(&games);
+    let now = Utc::from(SystemTime::now()).iso();
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM ratings WHERE league = ?").bind(league).execute(&mut *tx).await?;
+    for r in &fitted {
+        sqlx::query("INSERT INTO ratings (league, player, rating, games, computed_at) VALUES (?, ?, ?, ?, ?)")
+            .bind(league)
+            .bind(&r.player)
+            .bind(r.rating)
+            .bind(r.games as i64)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO rating_history (league, player, rating, games, computed_at, after_game) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(league)
+        .bind(&r.player)
+        .bind(r.rating)
+        .bind(r.games as i64)
+        .bind(&now)
+        .bind(after_game)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    let line: Vec<String> = fitted.iter().map(|r| format!("{} {:.0} ({})", r.player, r.rating, r.games)).collect();
+    info!("ratings {league}: {}", line.join(", "));
+    standings.send_modify(|st| {
+        st.insert(league.to_owned(), fitted.into_iter().map(|r| (r.player.clone(), r)).collect());
+    });
+    Ok(())
+}
+
+async fn apply(
+    pool: &SqlitePool,
+    records_dir: &Path,
+    standings: &watch::Sender<Standings>,
+    msg: StoreMsg,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match msg {
         StoreMsg::Login { name, password, reply } => {
             let ok = check_login(pool, &name, &password).await;
@@ -181,7 +292,7 @@ async fn apply(pool: &SqlitePool, records_dir: &Path, msg: StoreMsg) -> Result<(
                 (_, None) => "=",
             };
             sqlx::query(
-                "UPDATE games SET ended_at = ?, result = ?, reason = ?, ply_count = ?, final_sfen = ?, record_path = ? WHERE id = ?",
+                "UPDATE games SET ended_at = ?, result = ?, reason = ?, ply_count = ?, final_sfen = ?, record_path = ?, rated = ? WHERE id = ?",
             )
             .bind(Utc::from(f.ended_at).iso())
             .bind(result)
@@ -189,10 +300,28 @@ async fn apply(pool: &SqlitePool, records_dir: &Path, msg: StoreMsg) -> Result<(
             .bind(f.moves.len() as i64)
             .bind(f.moves.last().map_or(&f.game.initial_sfen, |m| &m.sfen_after))
             .bind(dir.display().to_string())
+            .bind(f.rated)
             .bind(&f.game.id)
             .execute(pool)
             .await?;
             info!("game {} ended {} {result} after {} plies", f.game.id, f.reason.as_str(), f.moves.len());
+            if f.rated && result != "void" {
+                rerate(pool, standings, &f.game.league, &f.game.id).await?;
+            }
+        }
+        StoreMsg::Round(r) => {
+            let pairs: Vec<[&str; 3]> = r.pairs.iter().map(|(s, g, id)| [s.as_str(), g.as_str(), id.as_str()]).collect();
+            sqlx::query(
+                "INSERT INTO rounds (league, scheduled_at, fired_at, pool_json, paired_json, sat_out) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&r.league)
+            .bind(Utc::from(r.scheduled_at).iso())
+            .bind(Utc::from(r.fired_at).iso())
+            .bind(serde_json::to_string(&r.pool)?)
+            .bind(serde_json::to_string(&pairs)?)
+            .bind(&r.sat_out)
+            .execute(pool)
+            .await?;
         }
         StoreMsg::Sync(reply) => {
             let _ = reply.send(());

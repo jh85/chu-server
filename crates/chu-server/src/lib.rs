@@ -2,7 +2,10 @@
 //! storage. `main.rs` only parses flags and calls [`Server::start`].
 
 pub mod game;
+pub mod league;
 pub mod lobby;
+pub mod pairing;
+pub mod rating;
 pub mod session;
 pub mod store;
 pub mod util;
@@ -81,6 +84,8 @@ pub struct Config {
     /// sqlx URL, e.g. `sqlite://chu.db` or `sqlite::memory:`.
     pub db_url: String,
     pub records_dir: PathBuf,
+    /// Floodgate leagues to schedule (`leagues.toml`).
+    pub leagues: Vec<league::LeagueConfig>,
 }
 
 /// A running server: store and lobby tasks, ready to take connections.
@@ -93,8 +98,8 @@ pub struct Server {
 
 impl Server {
     pub async fn start(cfg: Config) -> Result<Server, sqlx::Error> {
-        let store = store::spawn(&cfg.db_url, cfg.records_dir.clone()).await?;
-        let lobby = lobby::spawn(cfg.referee.clone(), store.clone());
+        let (store, standings) = store::spawn(&cfg.db_url, cfg.records_dir.clone()).await?;
+        let lobby = lobby::spawn(cfg.referee.clone(), store.clone(), standings, cfg.leagues);
         Ok(Server { lobby, store, next_conn: Default::default() })
     }
 

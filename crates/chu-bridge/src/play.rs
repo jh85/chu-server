@@ -157,6 +157,9 @@ fn idx(s: Side) -> usize {
     }
 }
 
+/// Keep-alive interval while queued; well under the 600 s idle limit.
+const KEEP_ALIVE: Duration = Duration::from_secs(60);
+
 pub async fn run(cfg: Config, mut engine: Engine) -> Res<()> {
     let mut bridge = Bridge { cfg: &cfg, engine: &mut engine, go_seq: 0, played: 0, track: None };
     let mut server: Option<Server> = None;
@@ -200,7 +203,16 @@ impl Bridge<'_> {
         srv.send(&format!("%%GAME {} {}", self.cfg.game, self.cfg.color.sign())).await?;
         let mut lines = Vec::new();
         loop {
-            let l = srv.recv().await?;
+            // A floodgate round can be half an hour away; keep the queued
+            // connection under the server's idle limit (§1).
+            let l = match tokio::time::timeout(KEEP_ALIVE, srv.recv()).await {
+                Ok(l) => l?,
+                Err(_) if lines.is_empty() => {
+                    srv.send("").await?;
+                    continue;
+                }
+                Err(_) => continue,
+            };
             match ServerMsg::parse(&l) {
                 ServerMsg::BeginSummary => lines = vec![l],
                 ServerMsg::Lobby(l) if l.starts_with("##[ERROR]") => return Err(Stop::Fatal(l)),

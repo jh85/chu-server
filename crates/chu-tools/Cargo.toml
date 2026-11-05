@@ -6,4 +6,7 @@ edition.workspace = true
 [dependencies]
 chu-proto.workspace = true
 chu-rules.workspace = true
+chu-server.workspace = true
 clap.workspace = true
+sqlx.workspace = true
+tokio.workspace = true

@@ -10,7 +10,7 @@ no perpetual-check rule, so a server `perpetualCheck` is accepted where the
 referee finds a repetition, and reported separately.
 
 With --db, the games table must hold one finished row per record with the same
-ply count and reason.
+ply count and reason, and no other finished row.
 
 Usage: check_results.py ROOT [--binary chushogi-gen] [--db chu.db] [--expect N]
 """
@@ -91,8 +91,10 @@ def main():
             n = db.execute("SELECT COUNT(*) FROM moves WHERE game_id = ?", (rec["id"],)).fetchone()[0]
             if n != rec["plies"]:
                 failures.append(f"{rec['id']}: {n} move rows, {rec['plies']} plies")
-        if len(rows) != len(dirs):
-            failures.append(f"{len(rows)} game rows, {len(dirs)} records")
+        # Games still running when the server stopped have no record yet.
+        finished = sum(1 for r in rows.values() if r[2] is not None)
+        if finished != len(dirs):
+            failures.append(f"{finished} finished game rows, {len(dirs)} records")
 
     if a.expect is not None and len(dirs) != a.expect:
         failures.append(f"{len(dirs)} records, expected {a.expect}")

@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use chu_rules::Backend;
@@ -21,6 +22,9 @@ struct Args {
     db: String,
     #[arg(long, default_value = "records")]
     records: PathBuf,
+    /// Floodgate league schedule.
+    #[arg(long, default_value = "leagues.toml")]
+    leagues: PathBuf,
     #[arg(long, value_enum, default_value = "ffi")]
     referee: RefereeKind,
     /// chushogi-gen binary for `--referee subprocess`.
@@ -35,13 +39,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
     let args = Args::parse();
     let referee = match args.referee {
         RefereeKind::Ffi => Backend::Ffi,
         RefereeKind::Subprocess => Backend::Subprocess(args.chushogi_gen),
     };
-    let server = Server::start(Config { referee, db_url: args.db, records_dir: args.records }).await?;
+    let leagues = chu_server::league::load(&args.leagues)?;
+    for l in &leagues {
+        info!("league {}: every {} min (+{}), cutoff {} s, rated {}", l.name, l.every_min, l.offset_min, l.cutoff_s, l.rated);
+    }
+    let server = Server::start(Config { referee, db_url: args.db, records_dir: args.records, leagues }).await?;
     let listener = TcpListener::bind(&args.listen).await?;
     info!("listening on {}", listener.local_addr()?);
     loop {

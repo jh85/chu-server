@@ -1,20 +1,24 @@
 //! Who is online, who waits for which game, and the running games.
 //!
-//! Phase 1 pairs challenge leagues only: two players naming the same game
-//! (and the same start SFEN) with compatible colours start at once. Floodgate
-//! leagues are scheduled in phase 3 and are refused for now.
+//! Challenge leagues pair at once: two players naming the same game (and the
+//! same start SFEN) with compatible colours. Floodgate leagues (`leagues.toml`)
+//! pair on a schedule: one task per league sends [`LobbyMsg::Round`] at each
+//! round time, and the lobby pairs the players queued before the cutoff who
+//! are not in a game (`pairing.rs`).
 
 use std::collections::{HashMap, HashSet};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chu_proto::{ColorReq, GameName, Side, TimeUnit};
 use chu_rules::{Backend, Rules, START_SFEN};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
 
 use crate::clock::TimeControl;
 use crate::game::{self, GameInput, GameSetup, GameTx, PlayerSlot};
-use crate::store::StoreTx;
+use crate::league::LeagueConfig;
+use crate::pairing::{self, Candidate, History, Rng};
+use crate::store::{RoundRecord, Standings, StoreMsg, StoreTx};
 use crate::util::Utc;
 use crate::{Conn, Ctl, GameLink};
 
@@ -29,6 +33,8 @@ pub enum LobbyMsg {
     Monitor { conn: Conn, id: String, on: bool },
     Chat { name: String, text: String },
     GameEnded { id: String },
+    /// A floodgate league's round time has come.
+    Round { league: String, scheduled_at: SystemTime },
 }
 
 pub type LobbyTx = mpsc::UnboundedSender<LobbyMsg>;
@@ -44,6 +50,7 @@ struct Waiter {
     game_name: String,
     color: ColorReq,
     sfen: String,
+    since: SystemTime,
 }
 
 struct RunningGame {
@@ -62,10 +69,18 @@ struct Lobby {
     /// Ids issued during the current second, so a pair that plays two games
     /// within one second gets distinct ids.
     recent_ids: (String, HashSet<String>),
+    leagues: HashMap<String, LeagueConfig>,
+    standings: watch::Receiver<Standings>,
+    history: HashMap<String, History>,
+    rng: Rng,
 }
 
-pub fn spawn(backend: Backend, store: StoreTx) -> LobbyTx {
+pub fn spawn(backend: Backend, store: StoreTx, standings: watch::Receiver<Standings>, leagues: Vec<LeagueConfig>) -> LobbyTx {
     let (tx, mut rx) = mpsc::unbounded_channel();
+    for cfg in &leagues {
+        tokio::spawn(schedule(cfg.clone(), tx.clone()));
+    }
+    let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
     let mut lobby = Lobby {
         backend,
         store,
@@ -74,6 +89,10 @@ pub fn spawn(backend: Backend, store: StoreTx) -> LobbyTx {
         waiting: Vec::new(),
         games: HashMap::new(),
         recent_ids: Default::default(),
+        leagues: leagues.into_iter().map(|l| (l.name.clone(), l)).collect(),
+        standings,
+        history: HashMap::new(),
+        rng: Rng::new(seed),
     };
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -81,6 +100,28 @@ pub fn spawn(backend: Backend, store: StoreTx) -> LobbyTx {
         }
     });
     tx
+}
+
+/// One league's clock: sends a `Round` at every round time. A round missed
+/// by more than its interval (a suspended host) is skipped with a warning,
+/// not fired late; the `rounds` table shows the gap.
+async fn schedule(cfg: LeagueConfig, lobby: LobbyTx) {
+    let mut next = cfg.next_round(SystemTime::now());
+    info!("{}: first round at {}", cfg.name, Utc::from(next).iso());
+    loop {
+        let wait = next.duration_since(SystemTime::now()).unwrap_or_default();
+        tokio::time::sleep(wait).await;
+        let now = SystemTime::now();
+        if now.duration_since(next).unwrap_or_default() < cfg.every() {
+            if lobby.send(LobbyMsg::Round { league: cfg.name.clone(), scheduled_at: next }).is_err() {
+                return;
+            }
+        } else {
+            warn!("{}: round at {} missed (woke at {})", cfg.name, Utc::from(next).iso(), Utc::from(now).iso());
+        }
+        // The wall clock can lag the timer a little; never repeat a round.
+        next = cfg.next_round(now.max(next));
+    }
 }
 
 fn compatible(a: ColorReq, b: ColorReq) -> bool {
@@ -162,7 +203,47 @@ impl Lobby {
                     }
                 }
             }
+            LobbyMsg::Round { league, scheduled_at } => self.round(league, scheduled_at),
         }
+    }
+
+    fn round(&mut self, league: String, scheduled_at: SystemTime) {
+        let Some(cfg) = self.leagues.get(&league).cloned() else { return };
+        let Ok(parsed) = league.parse::<GameName>() else { return };
+        let fired_at = SystemTime::now();
+        let cutoff = scheduled_at - Duration::from_secs(cfg.cutoff_s);
+        let ratings = self.standings.borrow().get(&league).cloned().unwrap_or_default();
+        let pool: Vec<Candidate> = self
+            .waiting
+            .iter()
+            .filter(|w| w.game_name == league && w.since <= cutoff)
+            .filter(|w| self.players.get(&w.name).is_some_and(|p| p.game.is_none()))
+            .map(|w| Candidate {
+                name: w.name.clone(),
+                rating: ratings.get(&w.name).filter(|r| r.published()).map(|r| r.rating),
+            })
+            .collect();
+        let hist = self.history.entry(league.clone()).or_default();
+        let round = pairing::pair(&pool, hist, &mut self.rng);
+        let mut pairs = Vec::new();
+        for (sente, gote) in round.pairs {
+            self.waiting.retain(|w| w.name != sente && w.name != gote);
+            let names = [sente.clone(), gote.clone()];
+            match self.start_game(parsed.clone(), league.clone(), names, START_SFEN.to_owned(), cfg.rated) {
+                Ok(id) => pairs.push((sente, gote, id)),
+                Err(e) => warn!("{league}: cannot start {sente} vs {gote}: {e}"),
+            }
+        }
+        info!(
+            "{league}: round {} with {} queued, {} games, sat out {:?}",
+            Utc::from(scheduled_at).iso(),
+            pool.len(),
+            pairs.len(),
+            round.sat_out
+        );
+        let pool = pool.into_iter().map(|c| c.name).collect();
+        let rec = RoundRecord { league, scheduled_at, fired_at, pool, pairs, sat_out: round.sat_out };
+        let _ = self.store.send(StoreMsg::Round(rec));
     }
 
     fn join(&mut self, name: String, conn_id: u64, game_name: String, color: ColorReq, sfen: Option<String>) {
@@ -185,20 +266,29 @@ impl Lobby {
             return error("already playing");
         }
         let Ok(parsed) = game_name.parse::<GameName>() else { return error(&format!("bad game name {game_name}")) };
-        if parsed.is_floodgate() {
-            return error("floodgate leagues are not scheduled yet");
-        }
         if sfen.is_some() && !parsed.is_test() {
             return error("a start SFEN is only allowed in chu-test leagues");
         }
         let sfen = sfen.unwrap_or_else(|| START_SFEN.to_owned());
+        let since = SystemTime::now();
+        if parsed.is_floodgate() {
+            if !self.leagues.contains_key(&game_name) {
+                return error(&format!("no floodgate league {game_name}"));
+            }
+            if color != ColorReq::Any {
+                return error("floodgate leagues take * only");
+            }
+            self.waiting.retain(|w| w.name != name);
+            self.waiting.push(Waiter { name, game_name, color, sfen, since });
+            return;
+        }
 
         self.waiting.retain(|w| w.name != name);
         let found = self.waiting.iter().position(|w| {
             w.game_name == game_name && w.sfen == sfen && compatible(w.color, color) && w.name != name
         });
         let Some(i) = found else {
-            self.waiting.push(Waiter { name, game_name, color, sfen });
+            self.waiting.push(Waiter { name, game_name, color, sfen, since });
             return;
         };
         let other = self.waiting.remove(i);
@@ -209,7 +299,8 @@ impl Lobby {
             (ColorReq::Sente, _) | (ColorReq::Any, ColorReq::Gote) | (ColorReq::Any, ColorReq::Any)
         );
         let names = if other_is_sente { [other.name, name] } else { [name, other.name] };
-        if let Err(e) = self.start_game(parsed, game_name, names, sfen) {
+        let rated = !parsed.is_test() && sfen == START_SFEN;
+        if let Err(e) = self.start_game(parsed, game_name, names, sfen, rated) {
             warn!("cannot start game: {e}");
         }
     }
@@ -229,7 +320,14 @@ impl Lobby {
         id
     }
 
-    fn start_game(&mut self, parsed: GameName, game_name: String, names: [String; 2], sfen: String) -> Result<(), String> {
+    fn start_game(
+        &mut self,
+        parsed: GameName,
+        game_name: String,
+        names: [String; 2],
+        sfen: String,
+        rated: bool,
+    ) -> Result<String, String> {
         let referee = (|| {
             let mut r = self.backend.create()?;
             r.set_rules(if parsed.jcsa { Rules::Jcsa } else { Rules::Lishogi })?;
@@ -256,7 +354,6 @@ impl Lobby {
             PlayerSlot { name: n.clone(), conn: p.map(|p| p.conn.clone()), ctl: p.map(|p| p.ctl.clone()) }
         };
         let players = [slot(&names[0]), slot(&names[1])];
-        let rated = !parsed.is_test() && sfen == START_SFEN;
         let tc = TimeControl::from_game_name(&parsed, TimeUnit::Msec);
         // The sessions route game lines before the summary goes out.
         let (tx, rx) = mpsc::unbounded_channel();
@@ -281,7 +378,7 @@ impl Lobby {
             rx,
         );
         info!("paired {} vs {} in {id}", names[0], names[1]);
-        self.games.insert(id, RunningGame { tx, game_name, names });
-        Ok(())
+        self.games.insert(id.clone(), RunningGame { tx, game_name, names });
+        Ok(id)
     }
 }

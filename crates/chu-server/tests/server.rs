@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chu_rules::Backend;
+use chu_server::league::LeagueConfig;
+use chu_server::lobby::LobbyMsg;
 use chu_server::{store, Config, Server};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -26,6 +28,15 @@ async fn server(test: &str) -> TestServer {
         referee: Backend::Ffi,
         db_url: format!("sqlite://{}", dir.join("chu.db").display()),
         records_dir: dir.join("records"),
+        // Daily, so the scheduler stays out of the tests; they send rounds.
+        leagues: vec![LeagueConfig {
+            name: "chu-floodgate-60-1F".into(),
+            every_min: 1440,
+            offset_min: 0,
+            cutoff_s: 5,
+            rules: "lishogi".into(),
+            rated: true,
+        }],
     };
     let server = Server::start(cfg).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -114,7 +125,8 @@ async fn lobby_errors() {
     let ts = server("lobby").await;
     let mut a = Client::login(&ts, "alice").await;
     for (line, err) in [
-        ("%%GAME chu-floodgate-600-10F *", "##[ERROR] floodgate leagues are not scheduled yet"),
+        ("%%GAME chu-floodgate-600-10F *", "##[ERROR] no floodgate league chu-floodgate-600-10F"),
+        ("%%GAME chu-floodgate-60-1F +", "##[ERROR] floodgate leagues take * only"),
         ("%%GAME chu-blitz-60-1F + 11k/12/12/12/12/12/12/12/12/12/12/K11 b - 1", "##[ERROR] a start SFEN is only allowed in chu-test leagues"),
         ("%%GAME chu-blitz-060-1F +", "##[ERROR] bad game name chu-blitz-060-1F"),
         ("%%SHOW nosuchgame", "##[ERROR] no such game nosuchgame"),
@@ -278,4 +290,101 @@ async fn long_line_in_game_is_illegal_action() {
     b.send(&"x".repeat(2000)).await;
     assert_eq!(b.until("<EOF>").await, ["#ILLEGAL_ACTION", "#LOSE", "<EOF>"]);
     assert_eq!((a.recv().await, a.recv().await), ("#ILLEGAL_ACTION".into(), "#WIN".into()));
+}
+
+/// Reads a client's Game_Summary (part of it may be in `seen` already) and
+/// answers AGREE; returns (game id, sente?).
+async fn agree(c: &mut Client, mut lines: Vec<String>) -> (String, bool) {
+    if let Some(i) = lines.iter().position(|l| l == "BEGIN Game_Summary") {
+        lines.drain(..i);
+    } else {
+        lines.clear();
+    }
+    if !lines.iter().any(|l| l == "END Game_Summary") {
+        lines.extend(c.until("END Game_Summary").await);
+    }
+    let field = |k: &str| lines.iter().find_map(|l| l.strip_prefix(k)).unwrap().to_owned();
+    c.send("AGREE").await;
+    (field("Game_ID:"), field("Your_Turn:") == "+")
+}
+
+#[tokio::test]
+async fn floodgate_round_pairs_the_pool_and_rates_the_games() {
+    let ts = server("floodgate").await;
+    let names = ["fa", "fb", "fc", "fd", "fe"];
+    let mut cs = Vec::new();
+    for n in names {
+        let mut c = Client::login(&ts, n).await;
+        c.send("%%GAME chu-floodgate-60-1F *").await;
+        cs.push(c);
+    }
+    // Syncs with the lobby: every %%GAME before has been handled.
+    cs[0].send("%%WHO").await;
+    let who = cs[0].until("##[WHO] +OK").await;
+    assert_eq!(who.iter().filter(|l| l.ends_with("waiting chu-floodgate-60-1F *")).count(), 5, "{who:?}");
+
+    // Queued less than the cutoff (5 s) before the round: nobody plays.
+    let league = "chu-floodgate-60-1F".to_owned();
+    let now = std::time::SystemTime::now();
+    ts.server.lobby.send(LobbyMsg::Round { league: league.clone(), scheduled_at: now }).unwrap();
+    // Queued long enough: four play, one sits out.
+    let later = now + Duration::from_secs(10);
+    ts.server.lobby.send(LobbyMsg::Round { league, scheduled_at: later }).unwrap();
+
+    let mut playing = Vec::new();
+    for (i, c) in cs.iter_mut().enumerate() {
+        c.send("%%WHO").await;
+        let who = c.until("##[WHO] +OK").await;
+        let me = who.iter().find(|l| l.starts_with(&format!("##[WHO] {} ", names[i]))).unwrap();
+        if me.contains(" playing ") {
+            playing.push((i, who));
+        }
+    }
+    assert_eq!(playing.len(), 4);
+    // Every sente resigns at once.
+    let mut sides = Vec::new();
+    for (i, seen) in playing {
+        let (_, sente) = agree(&mut cs[i], seen).await;
+        sides.push((i, sente));
+    }
+    for &(i, sente) in &sides {
+        let c = &mut cs[i];
+        c.until("START:").await;
+        if sente {
+            c.send("%TORYO").await;
+        }
+    }
+    for &(i, sente) in &sides {
+        let lines = cs[i].until("#RESIGN").await;
+        assert_eq!(lines.last().unwrap(), "#RESIGN");
+        assert_eq!(cs[i].recv().await, if sente { "#LOSE" } else { "#WIN" });
+    }
+    let playing: Vec<usize> = sides.iter().map(|s| s.0).collect();
+    store::sync(&ts.server.store).await;
+
+    let pool = store::open(&format!("sqlite://{}", ts.dir.join("chu.db").display())).await.unwrap();
+    let rounds: Vec<(String, String, Option<String>)> =
+        sqlx::query_as("SELECT pool_json, paired_json, sat_out FROM rounds ORDER BY scheduled_at").fetch_all(&pool).await.unwrap();
+    assert_eq!(rounds.len(), 2);
+    assert_eq!(rounds[0].0, "[]");
+    let pairs: Vec<[String; 3]> = serde_json::from_str(&rounds[1].1).unwrap();
+    assert_eq!(pairs.len(), 2);
+    let sat_out = rounds[1].2.clone().unwrap();
+    assert!(!playing.iter().any(|&i| names[i] == sat_out));
+
+    let ratings: Vec<(String, f64, i64)> =
+        sqlx::query_as("SELECT player, rating, games FROM ratings WHERE league = 'chu-floodgate-60-1F' ORDER BY player")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ratings.len(), 4);
+    assert!(ratings.iter().all(|r| r.2 == 1));
+    let mean = ratings.iter().map(|r| r.1).sum::<f64>() / 4.0;
+    assert!((mean - 1500.0).abs() < 1e-9);
+    for [sente, gote, _] in &pairs {
+        let r = |n: &str| ratings.iter().find(|x| x.0 == n).unwrap().1;
+        assert!(r(gote) > r(sente));
+    }
+    let (history,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM rating_history").fetch_one(&pool).await.unwrap();
+    assert_eq!(history, 2 + 4, "a refit after each game: 2 players, then 4");
 }
