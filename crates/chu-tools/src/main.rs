@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use chu_proto::{ClientMsg, ColorReq, GameSummary, ServerMsg, Side};
 use clap::{Parser, Subcommand};
@@ -37,10 +38,6 @@ enum Cmd {
         seed: Option<u64>,
         #[arg(long, default_value = chu_rules::BUILT_CHUSHOGI_GEN)]
         gen: PathBuf,
-        /// Wait at least this long before each move, to stay under the
-        /// server's 100 lines/s limit (SERVER-PROTOCOL.md §1).
-        #[arg(long, default_value_t = 0)]
-        min_move_ms: u64,
     },
 }
 
@@ -71,13 +68,40 @@ impl Gen {
     }
 }
 
+/// The server's line bucket (SERVER-PROTOCOL.md §1) mirrored on the sending
+/// side with a margin: a random player is far faster than 100 lines/s, so it
+/// waits only when the bucket would run dry.
+struct Bucket {
+    tokens: f64,
+    at: Instant,
+}
+
+impl Bucket {
+    const CAP: f64 = chu_proto::LINE_BURST as f64 * 0.9;
+    const RATE: f64 = chu_proto::LINES_PER_SEC as f64 * 0.9;
+
+    fn take(&mut self) {
+        let now = Instant::now();
+        self.tokens = (self.tokens + now.duration_since(self.at).as_secs_f64() * Self::RATE).min(Self::CAP);
+        self.at = now;
+        if self.tokens < 1.0 {
+            std::thread::sleep(Duration::from_secs_f64((1.0 - self.tokens) / Self::RATE));
+            self.tokens = 1.0;
+            self.at = Instant::now();
+        }
+        self.tokens -= 1.0;
+    }
+}
+
 struct Client {
     rd: BufReader<TcpStream>,
     wr: TcpStream,
+    bucket: Bucket,
 }
 
 impl Client {
     fn send(&mut self, line: &str) -> Res<()> {
+        self.bucket.take();
         writeln!(self.wr, "{line}")?;
         Ok(())
     }
@@ -91,7 +115,7 @@ impl Client {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn play(server: &str, name: &str, password: &str, game: &str, color: &str, games: u32, seed: Option<u64>, gen: &PathBuf, min_move_ms: u64) -> Res<()> {
+fn play(server: &str, name: &str, password: &str, game: &str, color: &str, games: u32, seed: Option<u64>, gen: &PathBuf) -> Res<()> {
     let color = match color {
         "+" => ColorReq::Sente,
         "-" => ColorReq::Gote,
@@ -104,7 +128,8 @@ fn play(server: &str, name: &str, password: &str, game: &str, color: &str, games
     }
     let sock = TcpStream::connect(server)?;
     sock.set_nodelay(true)?;
-    let mut c = Client { rd: BufReader::new(sock.try_clone()?), wr: sock };
+    let bucket = Bucket { tokens: Bucket::CAP, at: Instant::now() };
+    let mut c = Client { rd: BufReader::new(sock.try_clone()?), wr: sock, bucket };
     c.send(&ClientMsg::Login { name: name.into(), password: password.into(), x1: true }.to_string())?;
     match ServerMsg::parse(&c.recv()?) {
         ServerMsg::LoginOk(_) => {}
@@ -150,7 +175,6 @@ fn play(server: &str, name: &str, password: &str, game: &str, color: &str, games
                     pos.push_str(&moves.join(" "));
                 }
                 engine.cmd(&pos)?;
-                std::thread::sleep(std::time::Duration::from_millis(min_move_ms));
                 let best = engine.cmd("go random")?;
                 let mv = best.strip_prefix("bestmove ").ok_or("no bestmove")?;
                 if mv == "resign" {
@@ -190,8 +214,8 @@ fn play(server: &str, name: &str, password: &str, game: &str, color: &str, games
 
 fn main() -> Res<()> {
     match Cli::parse().cmd {
-        Cmd::Play { server, name, password, game, color, games, seed, gen, min_move_ms } => {
-            play(&server, &name, &password, &game, &color, games, seed, &gen, min_move_ms)
+        Cmd::Play { server, name, password, game, color, games, seed, gen } => {
+            play(&server, &name, &password, &game, &color, games, seed, &gen)
         }
     }
 }

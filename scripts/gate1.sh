@@ -4,14 +4,12 @@
 # clients; then every record must pass vendor/chushogi/tests/replay_test.py
 # and agree with random_match.py's referee (scripts/check_results.py).
 #
-# Usage: scripts/gate1.sh [OUT_DIR]     env: GAMES (100), PORT (14082),
-#        MIN_MOVE_MS (12: keeps each client under the 100 lines/s limit)
+# Usage: scripts/gate1.sh [OUT_DIR]     env: GAMES (100), PORT (14082)
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-$(mktemp -d)}
 GAMES=${GAMES:-100}
 PORT=${PORT:-14082}
-MIN_MOVE_MS=${MIN_MOVE_MS:-12}
 GAME=chu-test-60-1F
 
 cargo build --release -q --manifest-path "$ROOT/Cargo.toml"
@@ -26,7 +24,7 @@ SERVER=$!
 trap 'kill $SERVER 2>/dev/null || true' EXIT
 for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break; sleep 0.1; done
 
-common=(--server "127.0.0.1:$PORT" --game "$GAME" --games "$GAMES" --gen "$GEN" --min-move-ms "$MIN_MOVE_MS")
+common=(--server "127.0.0.1:$PORT" --game "$GAME" --games "$GAMES" --gen "$GEN")
 "$BIN/chu-tools" play "${common[@]}" --name random_a --color + --seed 1 > "$OUT/client_a.log" &
 A=$!
 "$BIN/chu-tools" play "${common[@]}" --name random_b --color - --seed 2 > "$OUT/client_b.log" &

@@ -229,3 +229,52 @@ async fn long_line_closes_connection() {
     a.send(&"x".repeat(2000)).await;
     assert_eq!(a.recv().await, "<EOF>");
 }
+
+/// Two logged-in players in a started chu-test-600-10F game.
+async fn started(ts: &TestServer) -> (Client, Client) {
+    let mut a = Client::login(ts, "alice").await;
+    let mut b = Client::login(ts, "bob").await;
+    a.send("%%GAME chu-test-600-10F +").await;
+    b.send("%%GAME chu-test-600-10F -").await;
+    a.until("END Game_Summary").await;
+    b.until("END Game_Summary").await;
+    a.send("AGREE").await;
+    b.send("AGREE").await;
+    assert!(a.recv().await.starts_with("START:"));
+    assert!(b.recv().await.starts_with("START:"));
+    (a, b)
+}
+
+#[tokio::test]
+async fn rate_limit_is_a_token_bucket() {
+    let ts = server("bucket").await;
+    let (mut a, mut b) = started(&ts).await;
+    // A burst within the bucket is fine...
+    a.wr.write_all("\n".repeat(450).as_bytes()).await.unwrap();
+    a.send("+8i8h").await;
+    assert!(a.recv().await.starts_with("+8i8h,T"));
+    assert!(b.recv().await.starts_with("+8i8h,T"));
+    b.send("-6c5e").await;
+    a.recv().await;
+    b.recv().await;
+    // ...and it refills at 100 lines/s: alice has about 49 lines left, then
+    // 150 more after 1.5 s.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    a.wr.write_all("\n".repeat(180).as_bytes()).await.unwrap();
+    a.send("+8h8g").await;
+    assert!(a.recv().await.starts_with("+8h8g,T"));
+    b.recv().await;
+    // Emptying it in a game loses on #ILLEGAL_ACTION, then the connection closes.
+    a.wr.write_all("\n".repeat(600).as_bytes()).await.unwrap();
+    assert_eq!(a.until("<EOF>").await, ["#ILLEGAL_ACTION", "#LOSE", "<EOF>"]);
+    assert_eq!((b.recv().await, b.recv().await), ("#ILLEGAL_ACTION".into(), "#WIN".into()));
+}
+
+#[tokio::test]
+async fn long_line_in_game_is_illegal_action() {
+    let ts = server("longline-game").await;
+    let (mut a, mut b) = started(&ts).await;
+    b.send(&"x".repeat(2000)).await;
+    assert_eq!(b.until("<EOF>").await, ["#ILLEGAL_ACTION", "#LOSE", "<EOF>"]);
+    assert_eq!((a.recv().await, a.recv().await), ("#ILLEGAL_ACTION".into(), "#WIN".into()));
+}

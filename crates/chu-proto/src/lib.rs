@@ -12,8 +12,9 @@ use std::fmt;
 
 /// Longest line a client may send (SERVER-PROTOCOL.md §1).
 pub const MAX_LINE: usize = 1024;
-/// Most lines per second from one connection (§1).
-pub const MAX_LINES_PER_SEC: u32 = 100;
+/// Line token bucket per connection (§1): capacity, and refill per second.
+pub const LINE_BURST: u32 = 500;
+pub const LINES_PER_SEC: u32 = 100;
 /// Idle limit outside a game, seconds (§1).
 pub const IDLE_TIMEOUT_S: u64 = 600;
 /// Time to answer a Game_Summary, seconds (§4).
@@ -195,6 +196,7 @@ pub enum Reason {
     Resign,
     TimeUp,
     IllegalMove,
+    IllegalAction,
     RoyalsLost,
     BareKing,
     Stalemate,
@@ -206,10 +208,11 @@ pub enum Reason {
 }
 
 impl Reason {
-    pub const ALL: [Reason; 11] = [
+    pub const ALL: [Reason; 12] = [
         Reason::Resign,
         Reason::TimeUp,
         Reason::IllegalMove,
+        Reason::IllegalAction,
         Reason::RoyalsLost,
         Reason::BareKing,
         Reason::Stalemate,
@@ -225,6 +228,7 @@ impl Reason {
             Reason::Resign => "#RESIGN",
             Reason::TimeUp => "#TIME_UP",
             Reason::IllegalMove => "#ILLEGAL_MOVE",
+            Reason::IllegalAction => "#ILLEGAL_ACTION",
             Reason::RoyalsLost => "#ROYALS_LOST",
             Reason::BareKing => "#BARE_KING",
             Reason::Stalemate => "#STALEMATE",

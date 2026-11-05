@@ -277,6 +277,14 @@ async fn reject_and_agree_timeout() {
     let t0 = Instant::now();
     assert_eq!(h.line(S).await, format!("REJECT:{ID} by a"));
     assert_eq!(t0.elapsed(), Duration::from_secs(30));
+
+    // A move before START is out of place; no game is in progress, so it
+    // cancels like REJECT.
+    let mut h = setup("chu-test-60-1F", START_SFEN);
+    h.summary(S).await;
+    h.summary(G).await;
+    h.send(S, "+8i8h");
+    assert_eq!(h.line(G).await, format!("REJECT:{ID} by a"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -344,14 +352,52 @@ async fn disconnect_and_resume() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn violation_is_chudan_and_monitors_see_moves() {
+async fn disconnected_player_loses_on_time() {
+    let mut h = setup("chu-test-60-1F", START_SFEN);
+    h.start().await;
+    h.play(S, "8i8h").await;
+    h.tx.send(GameInput::Disconnected { side: G, conn_id: h.conn_ids[1] }).unwrap();
+    let t0 = Instant::now();
+    // Sente alone sees the result; gote's clock ran out while away.
+    assert_eq!(h.line(S).await, "#TIME_UP");
+    assert_eq!(h.line(S).await, "#WIN");
+    assert_eq!(t0.elapsed(), Duration::from_secs(60));
+    let f = h.finished().await;
+    assert_eq!(f.winner, Some(S));
+}
+
+#[tokio::test(start_paused = true)]
+async fn commands_out_of_place_are_illegal_action() {
+    // AGREE (or REJECT) during play.
+    let mut h = setup("chu-test-60-1F", START_SFEN);
+    h.start().await;
+    h.play(S, "8i8h").await;
+    h.send(S, "AGREE");
+    assert_eq!(h.result().await, r("#ILLEGAL_ACTION", "#LOSE", "#WIN"));
+
+    // A move from a resumed player before it answered the summary.
+    let mut h = setup("chu-test-60-1F", START_SFEN);
+    h.start().await;
+    h.play(S, "8i8h").await;
+    h.tx.send(GameInput::Disconnected { side: G, conn_id: h.conn_ids[1] }).unwrap();
+    let (conn, out) = Conn::new(3);
+    let (ctl, _ctl_rx) = unbounded_channel();
+    h.out[1] = out;
+    h.tx.send(GameInput::Reattach { side: G, conn, ctl }).unwrap();
+    h.summary(G).await;
+    h.send(G, "-6c5e");
+    assert_eq!(h.result().await, r("#ILLEGAL_ACTION", "#WIN", "#LOSE"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn violation_is_illegal_action_and_monitors_see_moves() {
     let mut h = setup("chu-test-60-1F", START_SFEN);
     h.start().await;
     let (mon, mut mon_rx) = Conn::new(9);
     h.tx.send(GameInput::Monitor { conn: mon, on: true }).unwrap();
     h.play(S, "8i8h").await;
     h.tx.send(GameInput::Violation { side: G, conn_id: h.conn_ids[1] }).unwrap();
-    assert_eq!(h.result().await, r("#CHUDAN", "#CENSORED", "#CENSORED"));
+    assert_eq!(h.result().await, r("#ILLEGAL_ACTION", "#WIN", "#LOSE"));
     let mut seen = Vec::new();
     while let Ok(OutMsg::Line(l)) = mon_rx.try_recv() {
         seen.push(l);
@@ -361,11 +407,11 @@ async fn violation_is_chudan_and_monitors_see_moves() {
         [
             format!("##[MONITORON][{ID}] +OK"),
             format!("##[MONITOR][{ID}] +8i8h,T0"),
-            format!("##[MONITOR][{ID}] #CHUDAN"),
+            format!("##[MONITOR][{ID}] #ILLEGAL_ACTION"),
         ]
     );
     let f = h.finished().await;
-    assert_eq!((f.winner, f.moves.len()), (None, 1));
+    assert_eq!((f.winner, f.moves.len()), (Some(S), 1));
 }
 
 impl Harness {

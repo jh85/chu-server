@@ -261,6 +261,7 @@ fn status_names(reason: Reason) -> (&'static str, &'static str) {
         Reason::Resign => ("resign", "resign"),
         Reason::TimeUp => ("outoftime", "outoftime"),
         Reason::IllegalMove => ("illegalMove", "illegalMove"),
+        Reason::IllegalAction => ("illegalAction", "illegalAction"),
         Reason::Chudan => ("aborted", "aborted"),
     }
 }

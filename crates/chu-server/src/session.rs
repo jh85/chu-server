@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use chu_proto::{valid_name, ClientMsg, MAX_LINE, MAX_LINES_PER_SEC, IDLE_TIMEOUT_S};
+use chu_proto::{valid_name, ClientMsg, IDLE_TIMEOUT_S, LINES_PER_SEC, LINE_BURST, MAX_LINE};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Instant};
@@ -18,7 +18,7 @@ use crate::{Conn, Ctl, GameLink, OutMsg};
 
 enum Input {
     Line(String, Instant),
-    /// Line too long or too many lines per second.
+    /// Line too long or the line bucket ran dry.
     Violation(&'static str),
 }
 
@@ -54,8 +54,18 @@ where
                 }
                 Some(Input::Violation(why)) => {
                     info!("connection {conn_id} ({:?}): {why}, closing", s.name);
-                    if let Some(g) = &s.game {
+                    if let Some(g) = s.game.take() {
+                        // #ILLEGAL_ACTION: let the result lines reach the
+                        // violator before the connection closes.
                         let _ = g.tx.send(GameInput::Violation { side: g.side, conn_id });
+                        let wait = async {
+                            while let Some(ctl) = ctl_rx.recv().await {
+                                if matches!(ctl, Ctl::Left | Ctl::Kick) {
+                                    return;
+                                }
+                            }
+                        };
+                        let _ = tokio::time::timeout(Duration::from_secs(5), wait).await;
                     }
                     break;
                 }
@@ -145,7 +155,8 @@ impl Session {
 async fn read_loop<R: AsyncRead + Unpin>(rd: R, tx: mpsc::Sender<Input>) {
     let mut rd = BufReader::new(rd);
     let mut buf = Vec::new();
-    let mut window = (Instant::now(), 0u32);
+    // Token bucket (§1): LINE_BURST lines, refilled at LINES_PER_SEC.
+    let mut bucket = (Instant::now(), f64::from(LINE_BURST));
     loop {
         buf.clear();
         // Read one line, refusing to buffer more than MAX_LINE bytes.
@@ -174,14 +185,13 @@ async fn read_loop<R: AsyncRead + Unpin>(rd: R, tx: mpsc::Sender<Input>) {
             let _ = tx.send(Input::Violation("line over 1 KiB")).await;
             return;
         }
-        if now.duration_since(window.0) >= Duration::from_secs(1) {
-            window = (now, 0);
-        }
-        window.1 += 1;
-        if window.1 > MAX_LINES_PER_SEC {
-            let _ = tx.send(Input::Violation("over 100 lines/s")).await;
+        let refill = now.duration_since(bucket.0).as_secs_f64() * f64::from(LINES_PER_SEC);
+        bucket = (now, (bucket.1 + refill).min(f64::from(LINE_BURST)));
+        if bucket.1 < 1.0 {
+            let _ = tx.send(Input::Violation("line rate limit")).await;
             return;
         }
+        bucket.1 -= 1.0;
         if buf.last() == Some(&b'\r') {
             buf.pop();
         }

@@ -25,7 +25,8 @@ pub enum GameInput {
     /// when the session read it.
     Msg { side: Side, msg: ClientMsg, at: Instant },
     Disconnected { side: Side, conn_id: u64 },
-    /// Line too long or flooding: the session closes the connection.
+    /// Line too long or flooding: `#ILLEGAL_ACTION`, then the session closes
+    /// the connection.
     Violation { side: Side, conn_id: u64 },
     /// The player logged in again and asked for this game.
     Reattach { side: Side, conn: Conn, ctl: mpsc::UnboundedSender<Ctl> },
@@ -179,10 +180,15 @@ impl Game {
         }
     }
 
-    fn release_players(&mut self) {
-        // The lobby hears first, so a %%GAME sent after the result lines is
-        // never handled while the lobby still thinks the player is busy.
+    /// The lobby hears first, so a %%GAME sent after the result lines is
+    /// never handled while the lobby still thinks the player is busy.
+    fn release_lobby(&self) {
         let _ = self.lobby.send(LobbyMsg::GameEnded { id: self.id.clone() });
+    }
+
+    /// Sessions hear last: one closing for a violation waits for this, so
+    /// the result lines are queued before its connection closes.
+    fn release_sessions(&self) {
         for p in &self.players {
             if let Some(ctl) = &p.ctl {
                 let _ = ctl.send(Ctl::Left);
@@ -234,7 +240,9 @@ impl Game {
                                 }
                             }
                         }
-                        Some(GameInput::Msg { side, msg: ClientMsg::Reject(_), .. })
+                        // A move or %TORYO before START is out of place;
+                        // no game is in progress yet, so it cancels.
+                        Some(GameInput::Msg { side, msg: ClientMsg::Reject(_) | ClientMsg::Move { .. } | ClientMsg::Toryo, .. })
                         | Some(GameInput::Disconnected { side, .. })
                         | Some(GameInput::Violation { side, .. }) => break side,
                         _ => {}
@@ -247,8 +255,9 @@ impl Game {
         };
         let line = format!("REJECT:{} by {}", self.id, self.players[idx(rejected_by)].name);
         info!("{line}");
-        self.release_players();
+        self.release_lobby();
         self.send_both(&line);
+        self.release_sessions();
         false
     }
 
@@ -268,6 +277,10 @@ impl Game {
             let Some(input) = self.common(input) else { continue };
             match input {
                 GameInput::Msg { side, msg, at } => match msg {
+                    // A resuming player must answer the summary first.
+                    ClientMsg::Move { .. } | ClientMsg::Toryo if self.resuming[idx(side)] => {
+                        return Outcome(Reason::IllegalAction, Some(side.opponent()))
+                    }
                     ClientMsg::Move { side: colour, usi } => {
                         if let Some(end) = self.on_move(side, colour, &usi, at) {
                             return end;
@@ -278,7 +291,8 @@ impl Game {
                         self.resuming[idx(side)] = false;
                         self.send(side, &format!("START:{}", self.id));
                     }
-                    _ => {}
+                    // AGREE or REJECT during play.
+                    _ => return Outcome(Reason::IllegalAction, Some(side.opponent())),
                 },
                 GameInput::Disconnected { side, conn_id } => {
                     let p = &mut self.players[idx(side)];
@@ -290,7 +304,7 @@ impl Game {
                 }
                 GameInput::Violation { side, conn_id } => {
                     if self.players[idx(side)].conn.as_ref().is_some_and(|c| c.id == conn_id) {
-                        return Outcome(Reason::Chudan, None);
+                        return Outcome(Reason::IllegalAction, Some(side.opponent()));
                     }
                 }
                 GameInput::Reattach { side, conn, ctl } => {
@@ -406,11 +420,12 @@ impl Game {
             (_, Some(w)) if w == s => Verdict::Win,
             _ => Verdict::Lose,
         };
-        self.release_players();
+        self.release_lobby();
         for s in [Side::Sente, Side::Gote] {
             self.send(s, reason.as_str());
             self.send(s, verdict(s).as_str());
         }
+        self.release_sessions();
         self.send_monitors(reason.as_str());
         info!("game {} {} winner {:?} after {} plies", self.id, reason.as_str(), winner, self.moves.len());
         let finished = FinishedGame {
