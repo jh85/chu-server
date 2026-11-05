@@ -2,3 +2,18 @@
 name = "chu-server"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+chu-rules.workspace = true
+chu-proto.workspace = true
+argon2.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

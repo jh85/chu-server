@@ -2,3 +2,8 @@
 name = "chu-tools"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+chu-proto.workspace = true
+chu-rules.workspace = true
+clap.workspace = true

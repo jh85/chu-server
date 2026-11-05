@@ -9,7 +9,7 @@ edition = "2021"
 [workspace.dependencies]
 chu-rules = { path = "crates/chu-rules" }
 chu-proto = { path = "crates/chu-proto" }
-argon2 = "0.5"
+argon2 = { version = "0.5", features = ["std"] }
 cc = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
