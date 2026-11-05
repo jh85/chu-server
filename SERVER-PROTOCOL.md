@@ -1,6 +1,6 @@
 # Chu-Server Protocol 1.0 — client ↔ tournament server
 
-Status: draft 2, 2026-11-05. Derived from CSA Server Protocol 1.2.1 (shogi-server / floodgate); the session
+Status: draft 3, 2026-11-05. Derived from CSA Server Protocol 1.2.1 (shogi-server / floodgate); the session
 grammar is CSA's, the game content is USI-Chu (see `USI-CHU.md`). Reference implementation: `chu-server`;
 reference client: `chu-bridge`. "MUST / SHOULD / MAY" as in RFC 2119.
 
@@ -9,6 +9,8 @@ reference client: `chu-bridge`. "MUST / SHOULD / MAY" as in RFC 2119.
 - TCP, UTF-8, lines end with `\n`. One message per line. Timestamps anywhere in the protocol are UTC.
 - Limits per connection: 1 KiB per line; a token bucket of 500 lines refilled at 100 lines/s. Exceeding either
   is a protocol violation: `#ILLEGAL_ACTION` (a loss) if a game is in progress, then the connection is closed.
+  The bucket is a ceiling, not a target: a client that can move faster than that MUST pace itself (the reference
+  clients keep a slightly smaller copy of the bucket and wait only when it would run dry).
 - An empty line is a keep-alive. A connection silent for 600 s outside a game is closed.
 - Messages beginning with `%%` are lobby commands, `%` are game commands, `#` are server results, `+`/`-` are moves,
   `##[…]` are server notices (`##[ERROR] <text>` for a rejected lobby command).
@@ -70,9 +72,11 @@ Leagues named `floodgate` pair on the server's schedule; other leagues pair as s
 ```
 
 - `Game_ID` is `<game-name>+<sente>+<gote>+<UTC yyyymmddhhmmss>`, with `-2`, `-3`, … appended when two games start in the same second.
-- `Rules:` is `lishogi` or `jcsa`. `Time_Unit:` is `1msec` or `1sec` per league; all time fields use it.
+- `Rules:` is `lishogi` or `jcsa` (JCSA leagues are deferred; v1 runs lishogi rules only). `Time_Unit:` is `1msec` or `1sec` per league; all time fields use it.
 - `REJECT`, or no answer within 30 s, cancels the game: both players receive `REJECT:<game-id> by <name>` and return to the lobby.
 - A resumed game adds `MOVES:<move>,T<n>` lines after `SFEN:`, one per move already played; `To_Move:` is the side to move after them.
+  Its Time block also carries `Remaining+:<n>` and `Remaining-:<n>` (in `Time_Unit`), the clocks at the moment the
+  summary is sent; the side in `To_Move:` is already on the clock.
 
 ## 5. Moves and results
 
@@ -96,7 +100,7 @@ Every game ends with one reason line, then one verdict line (`#WIN`, `#LOSE`, `#
 | `#RESIGN` | opponent wins | `%TORYO` |
 | `#TIME_UP` | opponent wins | clock exhausted (server time), including while disconnected |
 | `#ILLEGAL_MOVE` | opponent wins | see above |
-| `#ILLEGAL_ACTION` | opponent wins | protocol violation: line/rate limits, command out of place |
+| `#ILLEGAL_ACTION` | opponent wins | protocol violation: line/rate limits, `AGREE`/`REJECT` during play; the violator receives the result lines before its connection closes |
 | `#ROYALS_LOST` | mover wins | last enemy royal captured |
 | `#BARE_KING` | winner per `Rules:` | bare-king rule; either side can be the winner |
 | `#STALEMATE` | mover wins | side to move has no legal move |
@@ -104,7 +108,7 @@ Every game ends with one reason line, then one verdict line (`#WIN`, `#LOSE`, `#
 | `#SENNICHITE` | draw | same position (board, side, lion-capture field) for the 4th time |
 | `#OUTE_SENNICHITE` | checking side loses | fourfold repetition with perpetual check (both rule sets) |
 | `#MAX_MOVES` | draw | ply 1000 reached; rated |
-| `#CHUDAN` | void, `#CENSORED` | server shutdown without recovery, or referee failure; never a player's fault |
+| `#CHUDAN` | void, `#CENSORED` | referee failure, or server shutdown without recovery; never a player's fault |
 
 After the verdict the players are back in the lobby and MAY send `%%GAME` again.
 

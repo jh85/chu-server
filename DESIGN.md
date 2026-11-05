@@ -240,8 +240,8 @@ The live board is the one place that needs chu shogi knowledge in the browser: a
 
 ```
 chu-bridge --server tourney.example:4081 --name az_v12 --password … \
-           --game chu-floodgate-600-10F --engine ./chushogi-az --engine-arg '--ckpt iter_0172.pt' \
-           --games 100 --usi-option Threads=8 --usi-option Sims=1024
+           --game chu-floodgate-600-10F --engine ./chushogi-az --usi-option EvalPort=5000 \
+           --games 100 --usi-option Sims=1024      # the eval server on EvalPort loads the checkpoint
 ```
 
 Translation rules:
@@ -305,7 +305,7 @@ Six phases, each ending in a gate that is a test you can run, not a judgement; t
 
 **Phase 3: Floodgate scheduler and rating**
 
-1. League config (TOML): name, cadence, cutoff, rule set, rated flag.
+1. League config (TOML): name, cadence, cutoff, rule set, rated flag. Also `Remaining+/-:` on resumed summaries and `chu-tools conformance --client`, carried over from phase 2.
 2. Scheduler task per league with the five-step pairing; `rounds` audit rows.
 3. Bradley-Terry rating task with the 15-game publication threshold; `chu-tools rate` recomputes from the `games` table and must reproduce the server's numbers.
 4. Gate: four bots of known strength order (random, random+mate-in-1, az iter\_0009, az iter\_0172) for 48 hours unattended; rounds fire on schedule; final ratings in the expected order; no round skipped.
@@ -330,7 +330,7 @@ Rough size: phases 0–3 are about 4,000 lines of Rust plus 150 lines of C++, so
 
 Decisions that change code in phase 0 or 1 and are worth settling before starting:
 
-- [ ] Perpetual check: lishogi makes it a loss, JCSA's `docs/jcsa/` may say something different for over-the-board play. Confirm the JCSA reading before wiring `#OUTE_SENNICHITE` to the `-jcsa` leagues, or make it a per-league flag.
+- [x] JCSA leagues are deferred (decided 5 Nov): v1 runs lishogi rules only. The engines already take a `Rules` USI option and the bridge sets it from `Rules:`, so turning a `-jcsa` league on later is config plus confirming the JCSA reading of perpetual check.
 - [ ] Jitto (lion pass) spelling in USI: `USI-CHU.md` defers to `chushogi-gen legal` as the normative list; replace that with the literal form once checked against lishogi.
 - [ ] Should the AlphaZero workers' evaluation tournaments (`az/checkpoint_tournament.py`) move onto the server, so every checkpoint comparison is a rated league with a public record? It is the same bridge; only a `chu-ckpt-…` league name and an instant-pairing mode are needed.
 - [ ] Where to host: the same Ubuntu box as the mail server (one more systemd unit behind nginx) or a separate small VM, so a runaway engine cannot touch mail delivery.
@@ -342,6 +342,8 @@ Settled on 5 Nov 2026 after the phase-1 report: disconnects keep the clock runni
 
 Status 5 Nov 2026: phases 0 and 1 done and both gates pass (commits 5686e86, e0fb11b; submodule branch `capi` at 33c3575, to be pushed and tagged). Phase-1 gate: 100 games at chu-test-60-1F, 32,053 positions, all records pass `replay_test.py`, results agree with `random_match.py`. The replay test compares recorded SFENs only when `CHU_REPLAY_GAMES` points at the lishogi game directory, which is not on the server machine.
 
+Status 5 Nov 2026, later: draft 2 applied (f316419) and phase 2 done (94291e1), both pushed. Gate: `chushogi-az` with `a0gb_iter_0202.pt` vs `chushogi-gen`, 20 games at 600+10F on CPU (eval server `--cpu`, ~2.5 s per 1024 sims), az won all 20 by `#ROYALS_LOST`, zero time or protocol losses, all 626 az moves matched the engine's `bestmove`, median move 8.9 s. Both engines gained a USI mode on the chushogi branch `usi` (ef10fa7; `chushogi-az` searches on its own thread so `stop` answers at once). Conformance: 10/10 for both engines. Spec draft 3 adds `Remaining+/-:` to resumed summaries, the `Rules` option, and the client-pacing rule. Not yet done: `chu-tools conformance --client` (phase 3).
+
 Risks and how the plan contains them:
 
 | Risk | Effect | Containment |
@@ -349,7 +351,7 @@ Risks and how the plan contains them:
 | FFI boundary bug (exception, lifetime, buffer size) crashes the whole server | All games in progress lost | `capi.cpp` catches every exception and returns a code; buffers are caller-sized with a documented maximum (legal list of 500 moves at 10 chars); the subprocess backend remains available per league as a fallback |
 | Repetition rule disagrees with lishogi | Rated results differ from the lishogi records you test against | Replay the lishogi games that ended in `repetition` through the game actor in phase 1 and require the same ply and outcome |
 | Scheduler and clocks drift under load | Rounds start late, engines lose on time unfairly | Clocks are measured per game from socket write/receive; the scheduler is a separate task; `/metrics` reports referee and echo latency so a slow host shows up before engines complain |
-| An engine floods the connection | Server CPU spent on parsing | Per-connection line length cap (1 KiB) and a token bucket of 500 lines refilled at 100/s (a plain 100/s cap was tripped by the random players in the phase-1 gate), then `#ILLEGAL_ACTION` and disconnect |
+| An engine floods the connection | Server CPU spent on parsing | Per-connection line length cap (1 KiB) and a token bucket of 500 lines refilled at 100/s, then `#ILLEGAL_ACTION` and disconnect. The bucket is a ceiling, not a target: the random players send ~500 lines/s at full speed, so the reference clients pace themselves against a copy of the bucket |
 | Rating fit unstable with few games | Early standings look random | Provisional ratings until 15 games, mean-1500 anchoring, and a random bot as a permanent floor the way floodgate relies on known engines |
 | Two rule sets drift apart in the engine | A JCSA league quietly plays lishogi rules | `Rules:` is echoed in Game\_Summary and stored per game; `jcsa_test.py` runs in the Rust CI through the FFI |
 

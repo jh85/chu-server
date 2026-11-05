@@ -1,7 +1,7 @@
 # USI-Chu 1.0 — engine protocol for chu shogi
 
-Status: draft, 2026-11-04. The reference client is `chu-bridge`; the reference engine is `chushogi-gen`
-(https://github.com/jh85/chushogi). "MUST / SHOULD / MAY" as in RFC 2119.
+Status: draft 2, 2026-11-05. The reference client is `chu-bridge`; the reference engine is `chushogi-gen`
+(https://github.com/jh85/chushogi), which enters USI mode on `usi`. "MUST / SHOULD / MAY" as in RFC 2119.
 
 USI-Chu is USI (Universal Shogi Interface) with chu shogi moves and positions and a few rules tightened.
 Anything not stated here is as in USI.
@@ -44,9 +44,9 @@ sfen lfcsgekgscfl/a1b1txot1b1a/mvrhdqndhrvm/pppppppppppp/3i4i3/12/12/3I4I3/PPPPP
 | Command | Rule |
 | --- | --- |
 | `usi` | Engine answers `id name …`, `id author …`, any `option …` lines, then `usiok`. |
-| `setoption name <n> [value <v>]` | Only before `isready` of a game. |
+| `setoption name <n> [value <v>]` | Only before `isready` of a game. Standard option names: `Rules` (`lishogi` \| `jcsa`, default `lishogi`): an engine that supports JCSA rules MUST offer it, and the client sets it from the server's `Rules:`. An engine without the option is used only in lishogi leagues. |
 | `isready` | Allowed any time the engine is not searching. Engine answers `readyok`. |
-| `usinewgame` | MUST precede the first `position` of every game. Resets repetition history and any per-game state. |
+| `usinewgame` | MUST precede the first `position` of every game. Resets repetition history and any per-game state. A `position` that arrives without it after `gameover` is a protocol error: the engine prints `info string error …`, then accepts the position anyway. |
 | `position startpos \| sfen <sfen> [moves <m1> …]` | Full history every time. Engines SHOULD treat an extension of the previous position incrementally. |
 | `go [id <n>] [btime <ms>] [wtime <ms>] [binc <ms>] [winc <ms>] [byoyomi <ms>] [nodes <n>] [movetime <ms>] [infinite]` | Start searching the current position. `b` = sente, `w` = gote. All times in milliseconds. `id` is an opaque integer the engine echoes. |
 | `stop` | Stop searching and answer `bestmove` now. `stop` with no search running is a no-op. |
