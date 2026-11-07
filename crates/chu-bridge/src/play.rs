@@ -285,12 +285,14 @@ impl Bridge<'_> {
             moves.push(m.usi.clone());
         }
         let mut to_move = summary.to_move;
-        let mut turn_start = match (&resumed, summary.time.remaining) {
-            // A resumed game's clocks as the server sent them (§4), the side
-            // to move charged up to the summary.
+        let mut turn_start = match (&resumed, summary.time.resumed) {
+            // A resumed game's clocks as the server sent them (§4): main time
+            // at the start of the turn, and the turn began Turn_Used ago, so
+            // the usual byoyomi or increment rule applies from here.
             (Some(_), Some(r)) => {
-                rem = r.map(|units| units * unit);
-                summary_at
+                rem = r.remaining.map(|units| units * unit);
+                let used = Duration::from_millis(r.turn_used * unit);
+                summary_at.checked_sub(used).unwrap_or(summary_at)
             }
             // Without them: the turn began at the last echo we saw, or, if the
             // opponent moved while we were away, no earlier than the drop.

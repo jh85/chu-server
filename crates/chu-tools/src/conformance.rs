@@ -5,12 +5,14 @@
 //! - Game A: the opponent resigns after the client's fourth move (#RESIGN).
 //! - Game B: on the client's turn after its third move the connection is
 //!   dropped; the client must log in again, ask for the same game, take the
-//!   resumed summary (`MOVES:`, `Remaining±`), and go on with a legal move.
-//!   After two more client moves the game ends in #CHUDAN.
+//!   resumed summary (`MOVES:`, `Remaining±` at the start of the turn and
+//!   `Turn_Used`, at least a second of it), and go on with a legal move within
+//!   the turn's time. After two more client moves the game ends in #CHUDAN.
 //! - Game C: the client must queue again after #CHUDAN; the opponent resigns
 //!   after the client's second move.
 //!
-//! Every client move must be legal (chu-rules), in turn and with its colour.
+//! Every client move must be legal (chu-rules), in turn, with its colour and
+//! within its time by the scripted server's clock.
 //! The client runs as `sh -c <cmd>` with `{server}` replaced by the scripted
 //! server's address (also in `CHU_SERVER`) and must play at least 3 games.
 
@@ -20,7 +22,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use chu_proto::clock::TimeControl;
-use chu_proto::{ClientMsg, ColorReq, GameName, GameSummary, PlayedMove, Side, TimeUnit, MAX_MOVES};
+use chu_proto::{ClientMsg, ColorReq, GameName, GameSummary, PlayedMove, ResumedClock, Side, TimeUnit, MAX_MOVES};
 use chu_rules::{Backend, GameEnd, Referee, START_SFEN};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -140,9 +142,9 @@ impl Game {
         let names = |s: Side| if s == self.client { client_name.to_owned() } else { OPPONENT.to_owned() };
         let mut time = self.tc.summary();
         if resumed {
-            let mut rem = self.rem;
-            rem[idx(self.to_move)] = rem[idx(self.to_move)].saturating_sub(self.turn_start.elapsed().as_millis() as u64);
-            time.remaining = Some(rem.map(|ms| self.tc.units(ms)));
+            // Main time at the start of the turn, and the turn so far (§4).
+            let used = self.turn_start.elapsed().as_millis() as u64;
+            time.resumed = Some(ResumedClock { remaining: self.rem.map(|ms| self.tc.units(ms)), turn_used: self.tc.units(used) });
         }
         GameSummary {
             protocol_version: "1.2".into(),
@@ -303,6 +305,13 @@ impl Script<'_> {
                         self.rep.check("client move is legal, in turn, with its colour", false, at);
                         return Ok(false);
                     }
+                    let used = g.turn_start.elapsed().as_millis() as u64;
+                    let allowed = g.tc.allowance_ms(g.rem[idx(g.client)]);
+                    if used > allowed {
+                        let at = format!("{} ply {}: {used} ms of {allowed}", g.id, g.moves.len() + 1);
+                        self.rep.check("client move within its time", false, at);
+                        return Ok(false);
+                    }
                     self.moves_checked += 1;
                     let echo = g.play(&usi)?;
                     c.send(&echo)?;
@@ -358,7 +367,10 @@ impl Script<'_> {
         self.rep.check("reconnects after a drop", true, "");
         self.login(&mut c, "logs in again")?;
         self.queue(&mut c, "asks for the same game again")?;
-        self.start(&mut c, &b, true, "resumed game B: AGREE to the summary with MOVES and Remaining")?;
+        // Make sure part of the turn is gone before the summary says so.
+        std::thread::sleep(Duration::from_secs(1).saturating_sub(b.turn_start.elapsed()));
+        let used = b.turn_start.elapsed().as_millis();
+        self.start(&mut c, &b, true, &format!("resumed game B: AGREE to MOVES, Remaining± and Turn_Used ({used} ms)"))?;
         let before = b.client_moves;
         let resumed_ok = self.play(&mut c, &mut b, before + 2)?;
         self.rep.check("resumed game B: continues with legal moves in turn", resumed_ok, format!("{} plies", b.moves.len()));
@@ -410,7 +422,7 @@ pub fn run(client: &str, client_log: Option<&std::path::Path>, seed: u64) -> Res
     };
     let outcome = script.run(&listener);
     let (games, moves) = (script.games, script.moves_checked);
-    rep.check("client moves legal, in turn, with their colour", moves > 0, format!("{moves} moves checked"));
+    rep.check("client moves legal, in turn, with their colour, in time", moves > 0, format!("{moves} moves checked"));
     if let Err(e) = outcome {
         rep.check("the script ran to its end", false, format!("{e} (after {games} games)"));
     }

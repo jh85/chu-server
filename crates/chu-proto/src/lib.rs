@@ -9,7 +9,7 @@ mod summary;
 
 pub use bucket::LineBucket;
 pub use game_name::GameName;
-pub use summary::{GameSummary, PlayedMove, SummaryError, TimeConfig, TimeUnit};
+pub use summary::{GameSummary, PlayedMove, ResumedClock, SummaryError, TimeConfig, TimeUnit};
 
 use std::fmt;
 

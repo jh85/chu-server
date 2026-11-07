@@ -33,8 +33,9 @@ pub enum LobbyMsg {
     Monitor { conn: Conn, id: String, on: bool },
     Chat { name: String, text: String },
     GameEnded { id: String },
-    /// A floodgate league's round time has come.
-    Round { league: String, scheduled_at: SystemTime },
+    /// A floodgate league's round time has come. The pool is the players
+    /// queued at or before `cutoff`.
+    Round { league: String, scheduled_at: SystemTime, cutoff: SystemTime },
 }
 
 pub type LobbyTx = mpsc::UnboundedSender<LobbyMsg>;
@@ -75,10 +76,16 @@ struct Lobby {
     rng: Rng,
 }
 
-pub fn spawn(backend: Backend, store: StoreTx, standings: watch::Receiver<Standings>, leagues: Vec<LeagueConfig>) -> LobbyTx {
+pub fn spawn(
+    backend: Backend,
+    store: StoreTx,
+    standings: watch::Receiver<Standings>,
+    leagues: Vec<LeagueConfig>,
+    last_rounds: &HashMap<String, SystemTime>,
+) -> LobbyTx {
     let (tx, mut rx) = mpsc::unbounded_channel();
     for cfg in &leagues {
-        tokio::spawn(schedule(cfg.clone(), tx.clone()));
+        tokio::spawn(schedule(cfg.clone(), last_rounds.get(&cfg.name).copied(), tx.clone()));
     }
     let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
     let mut lobby = Lobby {
@@ -102,27 +109,50 @@ pub fn spawn(backend: Backend, store: StoreTx, standings: watch::Receiver<Standi
     tx
 }
 
-/// One league's clock: sends a `Round` at every round time. A round missed
-/// by more than its interval (a suspended host) is skipped with a warning,
-/// not fired late; the `rounds` table shows the gap.
-async fn schedule(cfg: LeagueConfig, lobby: LobbyTx) {
-    let mut next = cfg.next_round(SystemTime::now());
-    info!("{}: first round at {}", cfg.name, Utc::from(next).iso());
+/// One league's clock: sends a `Round` at every round time. The
+/// missed-round rule (SERVER-PROTOCOL.md §3): a round whose time passed while
+/// the server was down, or while the host was suspended, is fired late only
+/// if the next round is not yet due; otherwise it is skipped with a warning
+/// and the `rounds` table shows the gap. At startup the late round waits
+/// `cutoff_s` + 30 s so that players can reconnect and queue first; its cutoff
+/// counts from when it fires.
+async fn schedule(cfg: LeagueConfig, last: Option<SystemTime>, lobby: LobbyTx) {
+    let cutoff_s = Duration::from_secs(cfg.cutoff_s);
+    let start = SystemTime::now();
+    let plan = cfg.startup(last, start, cutoff_s + LATE_GRACE);
+    if plan.skipped > 0 {
+        warn!("{}: {} round(s) missed while the server was down, skipped", cfg.name, plan.skipped);
+    }
+    if let Some(late) = plan.late {
+        info!("{}: round at {} missed while the server was down; fires late", cfg.name, Utc::from(late).iso());
+        tokio::time::sleep(cutoff_s + LATE_GRACE).await;
+        let now = SystemTime::now();
+        let round = LobbyMsg::Round { league: cfg.name.clone(), scheduled_at: late, cutoff: now - cutoff_s };
+        if now < plan.next && lobby.send(round).is_err() {
+            return;
+        }
+    }
+    let mut next = plan.next;
+    info!("{}: next round at {}", cfg.name, Utc::from(next).iso());
     loop {
         let wait = next.duration_since(SystemTime::now()).unwrap_or_default();
         tokio::time::sleep(wait).await;
         let now = SystemTime::now();
         if now.duration_since(next).unwrap_or_default() < cfg.every() {
-            if lobby.send(LobbyMsg::Round { league: cfg.name.clone(), scheduled_at: next }).is_err() {
+            let round = LobbyMsg::Round { league: cfg.name.clone(), scheduled_at: next, cutoff: next - cutoff_s };
+            if lobby.send(round).is_err() {
                 return;
             }
         } else {
-            warn!("{}: round at {} missed (woke at {})", cfg.name, Utc::from(next).iso(), Utc::from(now).iso());
+            warn!("{}: round at {} missed (woke at {}), skipped", cfg.name, Utc::from(next).iso(), Utc::from(now).iso());
         }
         // The wall clock can lag the timer a little; never repeat a round.
         next = cfg.next_round(now.max(next));
     }
 }
+
+/// How long after startup a late round waits, beyond the league's cutoff.
+const LATE_GRACE: Duration = Duration::from_secs(30);
 
 fn compatible(a: ColorReq, b: ColorReq) -> bool {
     !matches!((a, b), (ColorReq::Sente, ColorReq::Sente) | (ColorReq::Gote, ColorReq::Gote))
@@ -203,15 +233,14 @@ impl Lobby {
                     }
                 }
             }
-            LobbyMsg::Round { league, scheduled_at } => self.round(league, scheduled_at),
+            LobbyMsg::Round { league, scheduled_at, cutoff } => self.round(league, scheduled_at, cutoff),
         }
     }
 
-    fn round(&mut self, league: String, scheduled_at: SystemTime) {
+    fn round(&mut self, league: String, scheduled_at: SystemTime, cutoff: SystemTime) {
         let Some(cfg) = self.leagues.get(&league).cloned() else { return };
         let Ok(parsed) = league.parse::<GameName>() else { return };
         let fired_at = SystemTime::now();
-        let cutoff = scheduled_at - Duration::from_secs(cfg.cutoff_s);
         let ratings = self.standings.borrow().get(&league).cloned().unwrap_or_default();
         let pool: Vec<Candidate> = self
             .waiting

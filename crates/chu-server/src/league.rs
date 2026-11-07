@@ -50,6 +50,28 @@ impl LeagueConfig {
         UNIX_EPOCH + Duration::from_secs(k * every + offset % every)
     }
 
+    /// The missed-round rule (SERVER-PROTOCOL.md §3) at startup, given the
+    /// league's latest round in the `rounds` table: of the rounds whose time
+    /// passed while the server was down, the latest is fired late, at
+    /// `now + grace` (time for the players to reconnect and queue), if the
+    /// next round is not yet due then; the others are skipped.
+    pub fn startup(&self, last: Option<SystemTime>, now: SystemTime, grace: Duration) -> Startup {
+        let next = self.next_round(now);
+        let mut missed = 0;
+        let mut latest = None;
+        if let Some(last) = last {
+            let first = self.next_round(last);
+            if first < next {
+                let n = next.duration_since(first).unwrap_or_default().as_secs() / (self.every_min * 60);
+                missed = n;
+                latest = Some(next - self.every());
+            }
+        }
+        let late = latest.filter(|_| now + grace < next);
+        let skipped = missed - u64::from(late.is_some());
+        Startup { late, skipped, next }
+    }
+
     fn check(&self) -> Result<(), String> {
         let name: GameName = self.name.parse().map_err(|_| format!("{}: not a game name", self.name))?;
         let fail = |m: &str| Err(format!("{}: {m}", self.name));
@@ -70,6 +92,16 @@ impl LeagueConfig {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Startup {
+    /// The missed round to fire late, if any.
+    pub late: Option<SystemTime>,
+    /// How many missed rounds are skipped.
+    pub skipped: u64,
+    /// The first round on schedule.
+    pub next: SystemTime,
 }
 
 pub fn parse(text: &str) -> Result<Vec<LeagueConfig>, String> {
@@ -113,6 +145,26 @@ rated = true
         let shifted = LeagueConfig { offset_min: 5, ..l.clone() };
         assert_eq!(shifted.next_round(at(1_800_000_000)), at(1_800_000_300));
         assert_eq!(shifted.next_round(at(1_800_000_300)), at(1_800_002_100));
+    }
+
+    #[test]
+    fn missed_rounds_at_startup() {
+        let l = &parse(GOOD).unwrap()[0];
+        let at = |s: u64| UNIX_EPOCH + Duration::from_secs(s);
+        let g = Duration::from_secs(45);
+        let base = 1_800_000_000; // a round time
+        // First start ever, or nothing missed: just the next round.
+        assert_eq!(l.startup(None, at(base + 10), g), Startup { late: None, skipped: 0, next: at(base + 1800) });
+        assert_eq!(l.startup(Some(at(base)), at(base + 10), g), Startup { late: None, skipped: 0, next: at(base + 1800) });
+        // Down across one round: it fires late.
+        let s = l.startup(Some(at(base)), at(base + 1800 + 600), g);
+        assert_eq!(s, Startup { late: Some(at(base + 1800)), skipped: 0, next: at(base + 3600) });
+        // Down across three: the latest fires late, two are skipped.
+        let s = l.startup(Some(at(base)), at(base + 3 * 1800 + 60), g);
+        assert_eq!(s, Startup { late: Some(at(base + 3 * 1800)), skipped: 2, next: at(base + 4 * 1800) });
+        // Back so close to the next round that it would be due: skipped too.
+        let s = l.startup(Some(at(base)), at(base + 2 * 1800 - 30), g);
+        assert_eq!(s, Startup { late: None, skipped: 1, next: at(base + 2 * 1800) });
     }
 
     #[test]

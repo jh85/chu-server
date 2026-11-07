@@ -98,8 +98,9 @@ pub struct Server {
 
 impl Server {
     pub async fn start(cfg: Config) -> Result<Server, sqlx::Error> {
-        let (store, standings) = store::spawn(&cfg.db_url, cfg.records_dir.clone()).await?;
-        let lobby = lobby::spawn(cfg.referee.clone(), store.clone(), standings, cfg.leagues);
+        let opened = store::spawn(&cfg.db_url, cfg.records_dir.clone()).await?;
+        let store = opened.tx;
+        let lobby = lobby::spawn(cfg.referee.clone(), store.clone(), opened.standings, cfg.leagues, &opened.last_rounds);
         Ok(Server { lobby, store, next_conn: Default::default() })
     }
 

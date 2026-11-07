@@ -326,10 +326,11 @@ async fn floodgate_round_pairs_the_pool_and_rates_the_games() {
     // Queued less than the cutoff (5 s) before the round: nobody plays.
     let league = "chu-floodgate-60-1F".to_owned();
     let now = std::time::SystemTime::now();
-    ts.server.lobby.send(LobbyMsg::Round { league: league.clone(), scheduled_at: now }).unwrap();
+    let cutoff = |t: std::time::SystemTime| t - Duration::from_secs(5);
+    ts.server.lobby.send(LobbyMsg::Round { league: league.clone(), scheduled_at: now, cutoff: cutoff(now) }).unwrap();
     // Queued long enough: four play, one sits out.
     let later = now + Duration::from_secs(10);
-    ts.server.lobby.send(LobbyMsg::Round { league, scheduled_at: later }).unwrap();
+    ts.server.lobby.send(LobbyMsg::Round { league, scheduled_at: later, cutoff: cutoff(later) }).unwrap();
 
     let mut playing = Vec::new();
     for (i, c) in cs.iter_mut().enumerate() {

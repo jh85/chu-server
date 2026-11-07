@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use chu_proto::{ClientMsg, GameName, GameSummary, Side, TimeUnit};
+use chu_proto::{ClientMsg, GameName, GameSummary, ResumedClock, Side, TimeUnit};
 use chu_rules::{Backend, GameEnd, START_SFEN};
 use chu_server::clock::TimeControl;
 use chu_server::game::{self, GameInput, GameSetup, GameTx, PlayerSlot};
@@ -342,8 +342,10 @@ async fn disconnect_and_resume() {
     h.tx.send(GameInput::Reattach { side: G, conn, ctl }).unwrap();
     let sum = h.summary(G).await;
     assert_eq!(sum.your_turn, G);
-    // 60 s + 1 s Fischer: sente moved twice, gote once and is on the clock.
-    assert_eq!(sum.time.remaining, Some([62_000, 61_000 - 5_250]));
+    // 60 s + 1 s Fischer: sente moved twice, gote once and is on the clock,
+    // with 5.25 s of this turn used.
+    let want = ResumedClock { remaining: [62_000, 61_000], turn_used: 5_250 };
+    assert_eq!(sum.time.resumed, Some(want));
     assert_eq!(sum.to_move, G, "To_Move gives the side to move after the MOVES lines");
     let moves: Vec<_> = sum.moves.iter().map(|m| (m.side, m.usi.as_str())).collect();
     assert_eq!(moves, [(S, "8i8h"), (G, "6c5e"), (S, "8h8g")]);

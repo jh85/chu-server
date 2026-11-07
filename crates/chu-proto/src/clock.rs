@@ -47,7 +47,7 @@ impl TimeControl {
             byoyomi: self.byoyomi_ms / u,
             increment: self.increment_ms / u,
             least_time_per_move: self.least_ms / u,
-            remaining: None,
+            resumed: None,
         }
     }
 

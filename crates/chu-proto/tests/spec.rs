@@ -53,7 +53,7 @@ fn game_summary_example() {
     assert_eq!(s.max_moves, MAX_MOVES);
     assert_eq!(
         s.time,
-        TimeConfig { time_unit: TimeUnit::Msec, total_time: 600000, byoyomi: 0, increment: 10000, least_time_per_move: 0, remaining: None }
+        TimeConfig { time_unit: TimeUnit::Msec, total_time: 600000, byoyomi: 0, increment: 10000, least_time_per_move: 0, resumed: None }
     );
     assert!(s.sfen.starts_with("lfcsgekgscfl/") && s.sfen.ends_with(" b - 1"));
     assert!(s.moves.is_empty());
@@ -205,7 +205,10 @@ fn summary_encode_parse_identity() {
                 byoyomi: rng.below(100000),
                 increment: rng.below(100000),
                 least_time_per_move: rng.below(3),
-                remaining: (rng.below(2) == 0).then(|| [rng.below(1 << 40), rng.below(1 << 40)]),
+                resumed: (rng.below(2) == 0).then(|| ResumedClock {
+                    remaining: [rng.below(1 << 40), rng.below(1 << 40)],
+                    turn_used: rng.below(1 << 30),
+                }),
             },
             sfen: rng.word(SFEN, 120).trim().to_string() + "x",
             moves,
@@ -230,11 +233,14 @@ fn summary_rejects_malformed() {
     let mut dup = good.clone();
     dup.insert(3, "Rules:jcsa");
     assert!(GameSummary::parse(&dup).is_err());
-    // Remaining+ and Remaining- come in pairs.
+    // Remaining+, Remaining- and Turn_Used come together.
     let end_time = good.iter().position(|l| *l == "END Time").unwrap();
     let mut one = good.clone();
     one.insert(end_time, "Remaining+:5000");
     assert!(GameSummary::parse(&one).is_err());
     one.insert(end_time + 1, "Remaining-:7000");
-    assert_eq!(GameSummary::parse(&one).unwrap().time.remaining, Some([5000, 7000]));
+    assert!(GameSummary::parse(&one).is_err());
+    one.insert(end_time + 2, "Turn_Used:1200");
+    let want = ResumedClock { remaining: [5000, 7000], turn_used: 1200 };
+    assert_eq!(GameSummary::parse(&one).unwrap().time.resumed, Some(want));
 }

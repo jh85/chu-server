@@ -188,8 +188,24 @@ pub async fn load_standings(pool: &SqlitePool) -> Result<Standings, sqlx::Error>
     Ok(st)
 }
 
-pub async fn spawn(db_url: &str, records_dir: PathBuf) -> Result<(StoreTx, watch::Receiver<Standings>), sqlx::Error> {
+/// Each league's latest round in the `rounds` table.
+pub async fn last_rounds(pool: &SqlitePool) -> Result<HashMap<String, SystemTime>, sqlx::Error> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT league, MAX(scheduled_at) FROM rounds GROUP BY league").fetch_all(pool).await?;
+    Ok(rows.into_iter().filter_map(|(l, t)| Some((l, Utc::parse_iso(&t)?))).collect())
+}
+
+/// What the store hands the rest of the server when it starts.
+pub struct Opened {
+    pub tx: StoreTx,
+    pub standings: watch::Receiver<Standings>,
+    /// Each league's latest round, for the missed-round rule.
+    pub last_rounds: HashMap<String, SystemTime>,
+}
+
+pub async fn spawn(db_url: &str, records_dir: PathBuf) -> Result<Opened, sqlx::Error> {
     let pool = open(db_url).await?;
+    let last_rounds = last_rounds(&pool).await?;
     let (standings, standings_rx) = watch::channel(load_standings(&pool).await?);
     let (tx, mut rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -199,7 +215,7 @@ pub async fn spawn(db_url: &str, records_dir: PathBuf) -> Result<(StoreTx, watch
             }
         }
     });
-    Ok((tx, standings_rx))
+    Ok(Opened { tx, standings: standings_rx, last_rounds })
 }
 
 /// Refits a league from the games table and replaces its `ratings` rows.
