@@ -18,6 +18,9 @@ enum RefereeKind {
 struct Args {
     #[arg(long, default_value = "0.0.0.0:4081")]
     listen: String,
+    /// The web front end.
+    #[arg(long, default_value = "0.0.0.0:8080")]
+    http: String,
     #[arg(long, default_value = "sqlite://chu.db")]
     db: String,
     #[arg(long, default_value = "records")]
@@ -51,6 +54,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("league {}: every {} min (+{}), cutoff {} s, rated {}", l.name, l.every_min, l.offset_min, l.cutoff_s, l.rated);
     }
     let server = Server::start(Config { referee, db_url: args.db, records_dir: args.records, leagues }).await?;
+    let http = TcpListener::bind(&args.http).await?;
+    info!("web front end on http://{}", http.local_addr()?);
+    let router = server.router();
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(http, router).await {
+            tracing::error!("web front end: {e}");
+        }
+    });
     let listener = TcpListener::bind(&args.listen).await?;
     info!("listening on {}", listener.local_addr()?);
     loop {

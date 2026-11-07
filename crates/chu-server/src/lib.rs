@@ -9,6 +9,7 @@ pub mod rating;
 pub mod session;
 pub mod store;
 pub mod util;
+pub mod web;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -94,14 +95,22 @@ pub struct Server {
     pub lobby: lobby::LobbyTx,
     pub store: store::StoreTx,
     next_conn: std::sync::Arc<AtomicU64>,
+    web: std::sync::Arc<web::Ctx>,
 }
 
 impl Server {
     pub async fn start(cfg: Config) -> Result<Server, sqlx::Error> {
         let opened = store::spawn(&cfg.db_url, cfg.records_dir.clone()).await?;
         let store = opened.tx;
-        let lobby = lobby::spawn(cfg.referee.clone(), store.clone(), opened.standings, cfg.leagues, &opened.last_rounds);
-        Ok(Server { lobby, store, next_conn: Default::default() })
+        let lobby =
+            lobby::spawn(cfg.referee.clone(), store.clone(), opened.standings, cfg.leagues.clone(), &opened.last_rounds);
+        let web = web::open_ctx(&cfg.db_url, lobby.clone(), cfg.records_dir, cfg.leagues).await?;
+        Ok(Server { lobby, store, next_conn: Default::default(), web })
+    }
+
+    /// The web front end's routes (DESIGN.md), to serve on an HTTP listener.
+    pub fn router(&self) -> axum::Router {
+        web::router(self.web.clone())
     }
 
     /// Serves one client connection until it closes.

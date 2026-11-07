@@ -12,7 +12,8 @@ use chu_proto::{
     ClientMsg, GameName, GameSummary, PlayedMove, Reason, ResumedClock, Side, Verdict, AGREE_TIMEOUT_S, MAX_MOVES,
 };
 use chu_rules::{GameEnd, Referee};
-use tokio::sync::mpsc;
+use serde::Serialize;
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{sleep_until, Instant};
 use tracing::{info, warn};
 
@@ -34,6 +35,64 @@ pub enum GameInput {
     Reattach { side: Side, conn: Conn, ctl: mpsc::UnboundedSender<Ctl> },
     Monitor { conn: Conn, on: bool },
     Show { conn: Conn },
+    /// The web front end: the game as it stands, and its events from here on.
+    Watch { reply: oneshot::Sender<(LiveState, broadcast::Receiver<LiveEvent>)> },
+}
+
+/// A move as the web front end sees it.
+#[derive(Clone, Debug, Serialize)]
+pub struct LiveMove {
+    /// `b` (sente) or `w` (gote).
+    pub side: &'static str,
+    pub usi: String,
+    pub elapsed_ms: u64,
+    pub sfen: String,
+}
+
+/// A live game for the web front end; clocks in milliseconds.
+#[derive(Clone, Debug, Serialize)]
+pub struct LiveState {
+    pub id: String,
+    pub league: String,
+    pub sente: String,
+    pub gote: String,
+    pub initial_sfen: String,
+    pub moves: Vec<LiveMove>,
+    /// Both main times at the start of the current turn, sente first.
+    pub remaining_ms: [u64; 2],
+    pub to_move: &'static str,
+    /// Of the current turn; 0 before START.
+    pub turn_used_ms: u64,
+    pub byoyomi_ms: u64,
+    pub increment_ms: u64,
+    /// False until both players agreed.
+    pub started: bool,
+}
+
+/// What happens in a live game, for the web front end's SSE stream.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum LiveEvent {
+    Start,
+    Move {
+        ply: usize,
+        #[serde(flatten)]
+        mv: LiveMove,
+        /// Both main times after the move; the opponent's turn starts now.
+        remaining_ms: [u64; 2],
+    },
+    End {
+        reason: &'static str,
+        /// `sente`, `gote`, or null for a draw or a void game.
+        winner: Option<&'static str>,
+    },
+}
+
+fn side_code(s: Side) -> &'static str {
+    match s {
+        Side::Sente => "b",
+        Side::Gote => "w",
+    }
 }
 
 pub type GameTx = mpsc::UnboundedSender<GameInput>;
@@ -87,6 +146,8 @@ struct Game {
     seen: HashMap<String, Vec<usize>>,
     /// Players that reattached and have not answered the summary yet.
     resuming: [bool; 2],
+    started: bool,
+    events: broadcast::Sender<LiveEvent>,
 }
 
 /// Ending of a game: the reason line and the winner (None = draw or void).
@@ -101,6 +162,10 @@ pub fn spawn(setup: GameSetup) -> GameTx {
 /// Runs a game on a channel created by the caller.
 pub fn spawn_with(setup: GameSetup, rx: mpsc::UnboundedReceiver<GameInput>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run(setup, rx))
+}
+
+fn live_move(m: &RecordedMove) -> LiveMove {
+    LiveMove { side: side_code(m.side), usi: m.usi.clone(), elapsed_ms: m.elapsed_ms, sfen: m.sfen_after.clone() }
 }
 
 fn rep_key(sfen: &str) -> String {
@@ -128,6 +193,8 @@ async fn run(setup: GameSetup, mut rx: mpsc::UnboundedReceiver<GameInput>) {
         gave_check: Vec::new(),
         seen: HashMap::new(),
         resuming: [false; 2],
+        started: false,
+        events: broadcast::channel(256).0,
     };
     g.seen.insert(rep_key(&g.initial_sfen), vec![0]);
     if g.agree_phase(&mut rx).await {
@@ -231,6 +298,10 @@ impl Game {
                 conn.send(format!("##[SHOW][{}] +OK", self.id));
                 None
             }
+            GameInput::Watch { reply } => {
+                let _ = reply.send((self.live_state(), self.events.subscribe()));
+                None
+            }
             other => Some(other),
         }
     }
@@ -331,7 +402,7 @@ impl Game {
                     self.resuming[idx(side)] = true;
                     self.send_resume_summary(side);
                 }
-                GameInput::Monitor { .. } | GameInput::Show { .. } => unreachable!(),
+                GameInput::Monitor { .. } | GameInput::Show { .. } | GameInput::Watch { .. } => unreachable!(),
             }
         }
     }
@@ -383,6 +454,11 @@ impl Game {
         let ply = self.moves.len() as u32 + 1;
         let _ = self.store.send(StoreMsg::Move { game_id: self.id.clone(), ply, mv: mv.clone() });
         let key = rep_key(&mv.sfen_after);
+        let _ = self.events.send(LiveEvent::Move {
+            ply: self.moves.len() + 1,
+            mv: live_move(&mv),
+            remaining_ms: self.remaining_ms,
+        });
         self.moves.push(mv);
         self.gave_check.push(gave_check);
         self.to_move = mover.opponent();
@@ -443,6 +519,12 @@ impl Game {
         }
         self.release_sessions();
         self.send_monitors(reason.as_str());
+        let winner_name = match (reason, winner) {
+            (Reason::Chudan, _) | (_, None) => None,
+            (_, Some(Side::Sente)) => Some("sente"),
+            (_, Some(Side::Gote)) => Some("gote"),
+        };
+        let _ = self.events.send(LiveEvent::End { reason: reason.as_str(), winner: winner_name });
         info!("game {} {} winner {:?} after {} plies", self.id, reason.as_str(), winner, self.moves.len());
         let finished = FinishedGame {
             game: self.started_game(),
@@ -462,8 +544,27 @@ impl Game {
         let line = format!("START:{}", self.id);
         self.send_both(&line);
         self.turn_start = Instant::now();
+        self.started = true;
+        let _ = self.events.send(LiveEvent::Start);
         let _ = self.store.send(StoreMsg::Started(self.started_game()));
         info!("{line}");
+    }
+
+    fn live_state(&self) -> LiveState {
+        LiveState {
+            id: self.id.clone(),
+            league: self.name.to_string(),
+            sente: self.players[0].name.clone(),
+            gote: self.players[1].name.clone(),
+            initial_sfen: self.initial_sfen.clone(),
+            moves: self.moves.iter().map(live_move).collect(),
+            remaining_ms: self.remaining_ms,
+            to_move: side_code(self.to_move),
+            turn_used_ms: if self.started { self.turn_start.elapsed().as_millis() as u64 } else { 0 },
+            byoyomi_ms: self.tc.byoyomi_ms,
+            increment_ms: self.tc.increment_ms,
+            started: self.started,
+        }
     }
 
     fn started_game(&self) -> StartedGame {

@@ -11,11 +11,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chu_proto::{ColorReq, GameName, Side, TimeUnit};
 use chu_rules::{Backend, Rules, START_SFEN};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{info, warn};
 
 use crate::clock::TimeControl;
-use crate::game::{self, GameInput, GameSetup, GameTx, PlayerSlot};
+use crate::game::{self, GameInput, GameSetup, GameTx, LiveEvent, LiveState, PlayerSlot};
 use crate::league::LeagueConfig;
 use crate::pairing::{self, Candidate, History, Rng};
 use crate::store::{RoundRecord, Standings, StoreMsg, StoreTx};
@@ -33,12 +33,24 @@ pub enum LobbyMsg {
     Monitor { conn: Conn, id: String, on: bool },
     Chat { name: String, text: String },
     GameEnded { id: String },
+    /// The web front end: the state and events of a running game, or None.
+    Watch { id: String, reply: oneshot::Sender<Option<(LiveState, broadcast::Receiver<LiveEvent>)>> },
+    /// The web front end: who is online and what is being played.
+    Snapshot { reply: oneshot::Sender<LobbySnapshot> },
     /// A floodgate league's round time has come. The pool is the players
     /// queued at or before `cutoff`.
     Round { league: String, scheduled_at: SystemTime, cutoff: SystemTime },
 }
 
 pub type LobbyTx = mpsc::UnboundedSender<LobbyMsg>;
+
+#[derive(Debug, Clone, Default)]
+pub struct LobbySnapshot {
+    /// Name and what the player is doing, as `%%WHO` says it; sorted.
+    pub players: Vec<(String, String)>,
+    /// Id, game name, sente, gote; sorted by id.
+    pub games: Vec<(String, String, String, String)>,
+}
 
 struct Player {
     conn: Conn,
@@ -180,14 +192,7 @@ impl Lobby {
                 self.join(name, conn_id, game_name, color, sfen)
             }
             LobbyMsg::Who { conn } => {
-                let mut names: Vec<_> = self.players.iter().collect();
-                names.sort_by(|a, b| a.0.cmp(b.0));
-                for (name, p) in names {
-                    let state = match (&p.game, self.waiting.iter().find(|w| &w.name == name)) {
-                        (Some(id), _) => format!("playing {id}"),
-                        (None, Some(w)) => format!("waiting {} {}", w.game_name, w.color.sign()),
-                        (None, None) => "connected".into(),
-                    };
+                for (name, state) in self.who() {
                     conn.send(format!("##[WHO] {name} {state}"));
                 }
                 conn.send("##[WHO] +OK");
@@ -234,7 +239,50 @@ impl Lobby {
                 }
             }
             LobbyMsg::Round { league, scheduled_at, cutoff } => self.round(league, scheduled_at, cutoff),
+            LobbyMsg::Watch { id, reply } => match self.games.get(&id) {
+                Some(g) => {
+                    // The game answers; if it has just ended, the dropped
+                    // sender reads as None.
+                    let (tx, rx) = oneshot::channel();
+                    let _ = g.tx.send(GameInput::Watch { reply: tx });
+                    tokio::spawn(async move {
+                        let _ = reply.send(rx.await.ok());
+                    });
+                }
+                None => {
+                    let _ = reply.send(None);
+                }
+            },
+            LobbyMsg::Snapshot { reply } => {
+                let _ = reply.send(LobbySnapshot { players: self.who(), games: self.game_list() });
+            }
         }
+    }
+
+    fn who(&self) -> Vec<(String, String)> {
+        let mut names: Vec<_> = self.players.iter().collect();
+        names.sort_by(|a, b| a.0.cmp(b.0));
+        names
+            .into_iter()
+            .map(|(name, p)| {
+                let state = match (&p.game, self.waiting.iter().find(|w| &w.name == name)) {
+                    (Some(id), _) => format!("playing {id}"),
+                    (None, Some(w)) => format!("waiting {} {}", w.game_name, w.color.sign()),
+                    (None, None) => "connected".into(),
+                };
+                (name.clone(), state)
+            })
+            .collect()
+    }
+
+    fn game_list(&self) -> Vec<(String, String, String, String)> {
+        let mut v: Vec<_> = self
+            .games
+            .iter()
+            .map(|(id, g)| (id.clone(), g.game_name.clone(), g.names[0].clone(), g.names[1].clone()))
+            .collect();
+        v.sort();
+        v
     }
 
     fn round(&mut self, league: String, scheduled_at: SystemTime, cutoff: SystemTime) {

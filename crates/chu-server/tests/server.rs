@@ -16,6 +16,7 @@ const SFEN: &str = "g10k/12/12/12/12/11R/12/12/12/12/12/K11 b - 1";
 
 struct TestServer {
     addr: std::net::SocketAddr,
+    http: std::net::SocketAddr,
     server: Server,
     dir: PathBuf,
 }
@@ -49,7 +50,11 @@ async fn server(test: &str) -> TestServer {
             s.serve(sock);
         }
     });
-    TestServer { addr, server, dir }
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http = http_listener.local_addr().unwrap();
+    let router = server.router();
+    tokio::spawn(async move { axum::serve(http_listener, router).await.unwrap() });
+    TestServer { addr, http, server, dir }
 }
 
 struct Client {
@@ -388,4 +393,143 @@ async fn floodgate_round_pairs_the_pool_and_rates_the_games() {
     }
     let (history,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM rating_history").fetch_one(&pool).await.unwrap();
     assert_eq!(history, 2 + 4, "a refit after each game: 2 players, then 4");
+}
+
+/// GET over HTTP/1.1, `Connection: close`: (status, content type, body).
+async fn http_get(ts: &TestServer, path: &str) -> (u16, String, String) {
+    let mut sock = TcpStream::connect(ts.http).await.unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    sock.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), tokio::io::AsyncReadExt::read_to_end(&mut sock, &mut raw))
+        .await
+        .expect("HTTP response")
+        .unwrap();
+    let raw = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    let kind = head
+        .lines()
+        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-type: ").map(str::to_owned))
+        .unwrap_or_default();
+    (status, kind, body.to_owned())
+}
+
+/// An open SSE stream: yields (event, data).
+struct Sse(BufReader<TcpStream>);
+
+impl Sse {
+    async fn open(ts: &TestServer, path: &str) -> Sse {
+        let mut sock = TcpStream::connect(ts.http).await.unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: test\r\nAccept: text/event-stream\r\n\r\n");
+        sock.write_all(req.as_bytes()).await.unwrap();
+        Sse(BufReader::new(sock))
+    }
+
+    async fn next(&mut self) -> (String, serde_json::Value) {
+        let mut event = String::new();
+        loop {
+            let mut line = String::new();
+            let n = tokio::time::timeout(Duration::from_secs(10), self.0.read_line(&mut line)).await.expect("SSE event").unwrap();
+            assert!(n > 0, "SSE stream closed");
+            let line = line.trim_end();
+            if let Some(e) = line.strip_prefix("event: ") {
+                event = e.to_owned();
+            } else if let Some(d) = line.strip_prefix("data: ") {
+                if !event.is_empty() {
+                    return (event, serde_json::from_str(d).unwrap_or(serde_json::Value::String(d.to_owned())));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn web_pages_records_api_and_live_stream() {
+    let ts = server("web").await;
+    let (mut a, mut b) = started(&ts).await;
+    let snap = {
+        let mut w = Client::login(&ts, "watcher").await;
+        w.send("%%LIST").await;
+        w.until("##[LIST] +OK").await
+    };
+    let id = snap[0].strip_prefix("##[LIST] ").unwrap().to_owned();
+
+    // The live stream: the whole state first, then each move, then the end.
+    let mut sse = Sse::open(&ts, &format!("/game/{id}/events")).await;
+    let (ev, state) = sse.next().await;
+    assert_eq!(ev, "state");
+    assert_eq!((state["started"].as_bool(), state["moves"].as_array().map(Vec::len)), (Some(true), Some(0)));
+    assert_eq!(state["sente"], "alice");
+    let (status, _, page) = http_get(&ts, &format!("/game/{id}")).await;
+    assert_eq!(status, 200);
+    assert!(page.contains("\"live\":true") && page.contains("/static/board.js"), "{page}");
+
+    a.send("+8i8h").await;
+    a.recv().await;
+    b.recv().await;
+    let (ev, mv) = sse.next().await;
+    assert_eq!(ev, "move");
+    assert_eq!((mv["ply"].as_u64(), mv["usi"].as_str(), mv["side"].as_str()), (Some(1), Some("8i8h"), Some("b")));
+    assert!(mv["sfen"].as_str().unwrap().contains(" w "), "{mv}");
+    // 600 s + 10 s Fischer: sente gained the increment, gote untouched.
+    assert!(mv["remaining_ms"][0].as_u64().unwrap() > 600_000 && mv["remaining_ms"][1] == 600_000, "{mv}");
+    b.send("%TORYO").await;
+    let (ev, end) = sse.next().await;
+    assert_eq!(ev, "end");
+    assert_eq!((end["reason"].as_str(), end["winner"].as_str()), (Some("#RESIGN"), Some("sente")));
+    b.until("#LOSE").await;
+    store::sync(&ts.server.store).await;
+
+    // The same game from the database.
+    let (status, _, page) = http_get(&ts, &format!("/game/{id}")).await;
+    assert_eq!(status, 200);
+    assert!(page.contains("1–0 resign after 1 plies"), "{page}");
+    let (status, kind, json) = http_get(&ts, "/api/games?league=chu-test-600-10F").await;
+    assert_eq!((status, kind.as_str()), (200, "application/json"));
+    let games: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(games.as_array().unwrap().len(), 1);
+    let g = &games[0];
+    assert_eq!((g["id"].as_str(), g["winner"].as_str(), g["rated"].as_bool()), (Some(id.as_str()), Some("alice"), Some(false)));
+    let ended = g["ended_at"].as_str().unwrap();
+    let (_, _, none) = http_get(&ts, &format!("/api/games?since={ended}")).await;
+    assert_eq!(none, "[]");
+
+    // The record files behind the page's download links.
+    let record = g["record"].as_str().unwrap();
+    assert!(page.contains(&format!("{record}game.csa")), "{page}");
+    let (status, kind, rec) = http_get(&ts, &format!("{record}record.json")).await;
+    assert_eq!((status, kind.as_str()), (200, "application/json"));
+    let rec: serde_json::Value = serde_json::from_str(&rec).unwrap();
+    assert_eq!(rec["moves_usi"], serde_json::json!(["8i8h"]));
+    let (status, _, usi) = http_get(&ts, &format!("{record}moves.usi")).await;
+    assert_eq!((status, usi.as_str()), (200, "8i8h\n"));
+    let (status, _, listing) = http_get(&ts, "/records/").await;
+    assert!(status == 200 && listing.contains("chu-test-600-10F/"), "{listing}");
+    for bad in ["/records/../chu.db", "/records/%2e%2e/chu.db", "/records/chu-test-600-10F/../../chu.db"] {
+        assert_eq!(http_get(&ts, bad).await.0, 404, "{bad}");
+    }
+
+    // The other pages.
+    for (path, want) in [
+        ("/", "chu-test-600-10F"),
+        ("/league/chu-test-600-10F", "alice"),
+        ("/league/chu-test-600-10F/standings", "hx-get"),
+        ("/league/chu-floodgate-60-1F", "a round every 1440 min"),
+        ("/player/alice", "bob"),
+        ("/live", "Online"),
+    ] {
+        let (status, _, body) = http_get(&ts, path).await;
+        assert_eq!(status, 200, "{path}");
+        assert!(body.contains(want), "{path}: {body}");
+    }
+    let (status, kind, svg) = http_get(&ts, "/league/chu-test-600-10F/rating.svg").await;
+    assert_eq!((status, kind.as_str()), (200, "image/svg+xml; charset=utf-8"));
+    assert!(svg.contains("<svg") && svg.contains("No rated games yet"));
+    for path in ["/league/nope-1-1", "/game/nope", "/player/nobody", "/records/nope", "/static/nope.js", "/nope"] {
+        assert_eq!(http_get(&ts, path).await.0, 404, "{path}");
+    }
+    // A finished game's stream says so at once.
+    let (ev, _) = Sse::open(&ts, &format!("/game/{id}/events")).await.next().await;
+    assert_eq!(ev, "gone");
 }
