@@ -193,7 +193,7 @@ Disconnects: a player whose socket closes mid-game keeps its clock running and l
 
 ## Floodgate scheduling, pairing and rating
 
-Each floodgate league runs rounds on a fixed cadence from a config file (shogi-server's `floodgate-0-240.conf` idea): `chu-floodgate-600-10F` every 30 minutes, with a cutoff a few seconds before the round so late joiners wait for the next one. A game with 600 s + 10 s per side and a 1000-ply cap can in theory run about 3.5 hours, so the scheduler must not assume a round finishes before the next one starts; a player still in a game is simply not in the pool.
+Each floodgate league runs rounds on a fixed cadence from `leagues.toml` (`every_min`, `offset_min`, UTC; shogi-server's `floodgate-0-240.conf` idea): `chu-floodgate-600-10F` every 30 minutes, with a 15 s cutoff so late joiners wait for the next one. A round missed while the host was down is fired late only if the next one is not yet due, otherwise skipped with a warning. A game with 600 s + 10 s per side and a 1000-ply cap can in theory run about 3.5 hours, so the scheduler must not assume a round finishes before the next one starts; a player still in a game is simply not in the pool.
 
 Pairing per round, in order, as floodgate's `Pairing` chain does:
 
@@ -205,7 +205,7 @@ Pairing per round, in order, as floodgate's `Pairing` chain does:
 
 A `chu-test` league pairs instantly on demand instead of on a schedule.
 
-Rating follows floodgate's `mk_rate`: a maximum-likelihood fit of a Bradley-Terry model over all rated games in the league, scaled so that a 200-point gap is a 76% expected score, and anchored so the whole list has mean 1500. Players need 15 rated games before a rating is published (floodgate uses 15). Recompute after every game in a tokio task (a few thousand games fit in milliseconds with a fixed-point iteration), store the current value per player, and keep a history row per recompute so a rating curve per engine can be drawn. A Glicko-2 variant can be added later as a second column; the Bradley-Terry fit is kept because it is what floodgate publishes and what your scaling-law work can compare against.
+Rating follows floodgate's `mk_rate`: a Bradley-Terry fit over all rated games in the league, scaled so that a 200-point gap is a 76% expected score, and anchored so the whole list has mean 1500. The fit is regularised with one virtual draw per player against a fixed 1500 opponent, since a pure maximum-likelihood fit sends a player with only losses (the random bot) to minus infinity. Players need 15 rated games before a rating is published (floodgate uses 15). Recompute after every game in a tokio task (a few thousand games fit in milliseconds with a fixed-point iteration), store the current value per player, and keep a history row per recompute so a rating curve per engine can be drawn. A Glicko-2 variant can be added later as a second column; the Bradley-Terry fit is kept because it is what floodgate publishes and what your scaling-law work can compare against.
 
 Accounts: first `LOGIN` with an unknown name creates it with that password (floodgate practice); an admin CLI can ban a name or merge an engine's versions under an alias for the web page. Name convention for versions, as floodgate users do: `az_v12_1024sims`.
 
@@ -308,7 +308,7 @@ Six phases, each ending in a gate that is a test you can run, not a judgement; t
 1. League config (TOML): name, cadence, cutoff, rule set, rated flag. Also `Remaining+/-:` on resumed summaries and `chu-tools conformance --client`, carried over from phase 2.
 2. Scheduler task per league with the five-step pairing; `rounds` audit rows.
 3. Bradley-Terry rating task with the 15-game publication threshold; `chu-tools rate` recomputes from the `games` table and must reproduce the server's numbers.
-4. Gate: four bots of known strength order (random, random+mate-in-1, az iter\_0009, az iter\_0172) for 48 hours unattended; rounds fire on schedule; final ratings in the expected order; no round skipped.
+4. Gate: four bots (random, random+mate-in-1, az softz\_iter\_0202, az a0gb\_iter\_0202) for 48 hours unattended; rounds fire on schedule; final ratings satisfy random < mate-in-1 < both az bots (the two az bots have no known order); no round skipped.
 
 **Phase 4: Web front end**
 
@@ -343,6 +343,8 @@ Settled on 5 Nov 2026 after the phase-1 report: disconnects keep the clock runni
 Status 5 Nov 2026: phases 0 and 1 done and both gates pass (commits 5686e86, e0fb11b; submodule branch `capi` at 33c3575, to be pushed and tagged). Phase-1 gate: 100 games at chu-test-60-1F, 32,053 positions, all records pass `replay_test.py`, results agree with `random_match.py`. The replay test compares recorded SFENs only when `CHU_REPLAY_GAMES` points at the lishogi game directory, which is not on the server machine.
 
 Status 5 Nov 2026, later: draft 2 applied (f316419) and phase 2 done (94291e1), both pushed. Gate: `chushogi-az` with `a0gb_iter_0202.pt` vs `chushogi-gen`, 20 games at 600+10F on CPU (eval server `--cpu`, ~2.5 s per 1024 sims), az won all 20 by `#ROYALS_LOST`, zero time or protocol losses, all 626 az moves matched the engine's `bestmove`, median move 8.9 s. Both engines gained a USI mode on the chushogi branch `usi` (ef10fa7; `chushogi-az` searches on its own thread so `stop` answers at once). Conformance: 10/10 for both engines. Spec draft 3 adds `Remaining+/-:` to resumed summaries, the `Rules` option, and the client-pacing rule. Not yet done: `chu-tools conformance --client` (phase 3).
+
+Status 5 Nov 2026, evening: draft 3 (becf6d5) and phase 3 (e0f155b) done; `chu-tools conformance --client` plays three scripted games (resign, drop and resume, `#CHUDAN` and re-queue). A 36-round rehearsal at 1-minute cadence fired every round within 2 ms and ordered the bots random 1031 < random_mate1 1317 < az_softz 1697 < az_a0gb 1954. The 48-hour gate started 2026-11-05 18:22 UTC with four bots (random, random+mate-in-1 via `MateNodes=1`, az softz_iter_0202, az a0gb_iter_0202, all on CPU); phase 3 is pushed after it passes. Spec draft 4 adds `Turn_Used:` to resumed summaries and the missed-round rule.
 
 Risks and how the plan contains them:
 

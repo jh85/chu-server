@@ -1,6 +1,6 @@
 # Chu-Server Protocol 1.0 — client ↔ tournament server
 
-Status: draft 3, 2026-11-05. Derived from CSA Server Protocol 1.2.1 (shogi-server / floodgate); the session
+Status: draft 4, 2026-11-05. Derived from CSA Server Protocol 1.2.1 (shogi-server / floodgate); the session
 grammar is CSA's, the game content is USI-Chu (see `USI-CHU.md`). Reference implementation: `chu-server`;
 reference client: `chu-bridge`. "MUST / SHOULD / MAY" as in RFC 2119.
 
@@ -39,7 +39,10 @@ is mandatory. A second login with the same name closes the first connection.
 
 Game-name grammar: `chu-<league>-<total-s>-<byoyomi-s>[F][-jcsa]`.
 `chu-floodgate-600-10F` = 600 s + 10 s Fischer, lishogi rules; `chu-floodgate-900-30-jcsa` = 900 s + 30 s byoyomi, JCSA rules.
-Leagues named `floodgate` pair on the server's schedule; other leagues pair as soon as two queued players match.
+Leagues named `floodgate` pair on the server's schedule (`every_min` and `offset_min`, UTC, in `leagues.toml`);
+other leagues pair as soon as two queued players match. A round whose time passed while the server was not running
+is fired late only if the next round is not yet due; otherwise it is skipped with a warning and the gap is visible
+in the rounds audit table.
 
 ## 4. Game start
 
@@ -75,8 +78,11 @@ Leagues named `floodgate` pair on the server's schedule; other leagues pair as s
 - `Rules:` is `lishogi` or `jcsa` (JCSA leagues are deferred; v1 runs lishogi rules only). `Time_Unit:` is `1msec` or `1sec` per league; all time fields use it.
 - `REJECT`, or no answer within 30 s, cancels the game: both players receive `REJECT:<game-id> by <name>` and return to the lobby.
 - A resumed game adds `MOVES:<move>,T<n>` lines after `SFEN:`, one per move already played; `To_Move:` is the side to move after them.
-  Its Time block also carries `Remaining+:<n>` and `Remaining-:<n>` (in `Time_Unit`), the clocks at the moment the
-  summary is sent; the side in `To_Move:` is already on the clock.
+  Its Time block also carries `Remaining+:<n>`, `Remaining-:<n>` and `Turn_Used:<n>` (all in `Time_Unit`):
+  `Remaining±` is each side's main time as it stood at the start of the current turn (not yet charged for it),
+  and `Turn_Used` is how much of the current turn the side in `To_Move:` has already used. The client applies
+  the league's normal rule (byoyomi or increment) to those two numbers, so a player already in byoyomi is
+  represented correctly.
 
 ## 5. Moves and results
 
