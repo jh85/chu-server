@@ -65,7 +65,7 @@ def main():
             send("usinewgame")
             send("position startpos" + (" moves " + " ".join(moves) if moves else ""))
             send(f"go nodes {sims}")
-            info = until("info")
+            info = until("info depth")  # not an "info string" line
             until("bestmove")
             ms = int(info[info.index("time") + 1])
             rows.append((sims, ms))
