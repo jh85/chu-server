@@ -1,22 +1,22 @@
 //! Who is online, who waits for which game, and the running games.
 //!
-//! Challenge leagues pair at once: two players naming the same game (and the
-//! same start SFEN) with compatible colours. Floodgate leagues (`leagues.toml`)
-//! pair on a schedule: one task per league sends [`LobbyMsg::Round`] at each
-//! round time, and the lobby pairs the players queued before the cutoff who
-//! are not in a game (`pairing.rs`).
+//! Every league comes from `leagues.toml`. Challenge and test leagues pair at
+//! once: the first two players queued for the league (with the same start
+//! SFEN, in test leagues) whose colours fit. Floodgate leagues pair on a
+//! schedule: one task per league sends [`LobbyMsg::Round`] at each round
+//! time, and the lobby pairs the players queued before the cutoff who are not
+//! in a game (`pairing.rs`).
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chu_proto::{ColorReq, GameName, Side, TimeUnit};
-use chu_rules::{Backend, Rules, START_SFEN};
+use chu_proto::{ColorReq, Side, TimeUnit};
+use chu_rules::{Backend, START_SFEN};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{info, warn};
 
-use crate::clock::TimeControl;
 use crate::game::{self, GameInput, GameSetup, GameTx, LiveEvent, LiveState, PlayerSlot};
-use crate::league::LeagueConfig;
+use crate::league::{Kind, LeagueConfig, Schedule};
 use crate::pairing::{self, Candidate, History, Rng};
 use crate::store::{RoundRecord, Standings, StoreMsg, StoreTx};
 use crate::util::Utc;
@@ -97,7 +97,9 @@ pub fn spawn(
 ) -> LobbyTx {
     let (tx, mut rx) = mpsc::unbounded_channel();
     for cfg in &leagues {
-        tokio::spawn(schedule(cfg.clone(), last_rounds.get(&cfg.name).copied(), tx.clone()));
+        if let Some(sched) = cfg.schedule() {
+            tokio::spawn(schedule(cfg.name.clone(), sched, last_rounds.get(&cfg.name).copied(), tx.clone()));
+        }
     }
     let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
     let mut lobby = Lobby {
@@ -128,35 +130,35 @@ pub fn spawn(
 /// and the `rounds` table shows the gap. At startup the late round waits
 /// `cutoff_s` + 30 s so that players can reconnect and queue first; its cutoff
 /// counts from when it fires.
-async fn schedule(cfg: LeagueConfig, last: Option<SystemTime>, lobby: LobbyTx) {
+async fn schedule(league: String, cfg: Schedule, last: Option<SystemTime>, lobby: LobbyTx) {
     let cutoff_s = Duration::from_secs(cfg.cutoff_s);
     let start = SystemTime::now();
     let plan = cfg.startup(last, start, cutoff_s + LATE_GRACE);
     if plan.skipped > 0 {
-        warn!("{}: {} round(s) missed while the server was down, skipped", cfg.name, plan.skipped);
+        warn!("{}: {} round(s) missed while the server was down, skipped", league, plan.skipped);
     }
     if let Some(late) = plan.late {
-        info!("{}: round at {} missed while the server was down; fires late", cfg.name, Utc::from(late).iso());
+        info!("{}: round at {} missed while the server was down; fires late", league, Utc::from(late).iso());
         tokio::time::sleep(cutoff_s + LATE_GRACE).await;
         let now = SystemTime::now();
-        let round = LobbyMsg::Round { league: cfg.name.clone(), scheduled_at: late, cutoff: now - cutoff_s };
+        let round = LobbyMsg::Round { league: league.clone(), scheduled_at: late, cutoff: now - cutoff_s };
         if now < plan.next && lobby.send(round).is_err() {
             return;
         }
     }
     let mut next = plan.next;
-    info!("{}: next round at {}", cfg.name, Utc::from(next).iso());
+    info!("{}: next round at {}", league, Utc::from(next).iso());
     loop {
         let wait = next.duration_since(SystemTime::now()).unwrap_or_default();
         tokio::time::sleep(wait).await;
         let now = SystemTime::now();
         if now.duration_since(next).unwrap_or_default() < cfg.every() {
-            let round = LobbyMsg::Round { league: cfg.name.clone(), scheduled_at: next, cutoff: next - cutoff_s };
+            let round = LobbyMsg::Round { league: league.clone(), scheduled_at: next, cutoff: next - cutoff_s };
             if lobby.send(round).is_err() {
                 return;
             }
         } else {
-            warn!("{}: round at {} missed (woke at {}), skipped", cfg.name, Utc::from(next).iso(), Utc::from(now).iso());
+            warn!("{}: round at {} missed (woke at {}), skipped", league, Utc::from(next).iso(), Utc::from(now).iso());
         }
         // The wall clock can lag the timer a little; never repeat a round.
         next = cfg.next_round(now.max(next));
@@ -287,7 +289,6 @@ impl Lobby {
 
     fn round(&mut self, league: String, scheduled_at: SystemTime, cutoff: SystemTime) {
         let Some(cfg) = self.leagues.get(&league).cloned() else { return };
-        let Ok(parsed) = league.parse::<GameName>() else { return };
         let fired_at = SystemTime::now();
         let ratings = self.standings.borrow().get(&league).cloned().unwrap_or_default();
         let pool: Vec<Candidate> = self
@@ -306,7 +307,7 @@ impl Lobby {
         for (sente, gote) in round.pairs {
             self.waiting.retain(|w| w.name != sente && w.name != gote);
             let names = [sente.clone(), gote.clone()];
-            match self.start_game(parsed.clone(), league.clone(), names, START_SFEN.to_owned(), cfg.rated) {
+            match self.start_game(&cfg, names, START_SFEN.to_owned(), cfg.rated) {
                 Ok(id) => pairs.push((sente, gote, id)),
                 Err(e) => warn!("{league}: cannot start {sente} vs {gote}: {e}"),
             }
@@ -342,16 +343,15 @@ impl Lobby {
         if player.game.is_some() {
             return error("already playing");
         }
-        let Ok(parsed) = game_name.parse::<GameName>() else { return error(&format!("bad game name {game_name}")) };
-        if sfen.is_some() && !parsed.is_test() {
-            return error("a start SFEN is only allowed in chu-test leagues");
+        let Some(cfg) = self.leagues.get(&game_name).cloned() else {
+            return error(&format!("unknown league {game_name}"));
+        };
+        if sfen.is_some() && cfg.kind != Kind::Test {
+            return error("a start SFEN is only allowed in test leagues");
         }
         let sfen = sfen.unwrap_or_else(|| START_SFEN.to_owned());
         let since = SystemTime::now();
-        if parsed.is_floodgate() {
-            if !self.leagues.contains_key(&game_name) {
-                return error(&format!("no floodgate league {game_name}"));
-            }
+        if cfg.kind == Kind::Floodgate {
             if color != ColorReq::Any {
                 return error("floodgate leagues take * only");
             }
@@ -376,8 +376,9 @@ impl Lobby {
             (ColorReq::Sente, _) | (ColorReq::Any, ColorReq::Gote) | (ColorReq::Any, ColorReq::Any)
         );
         let names = if other_is_sente { [other.name, name] } else { [name, other.name] };
-        let rated = !parsed.is_test() && sfen == START_SFEN;
-        if let Err(e) = self.start_game(parsed, game_name, names, sfen, rated) {
+        // Test leagues are never rated (checked at load).
+        let rated = cfg.rated && cfg.kind != Kind::Test;
+        if let Err(e) = self.start_game(&cfg, names, sfen, rated) {
             warn!("cannot start game: {e}");
         }
     }
@@ -397,17 +398,11 @@ impl Lobby {
         id
     }
 
-    fn start_game(
-        &mut self,
-        parsed: GameName,
-        game_name: String,
-        names: [String; 2],
-        sfen: String,
-        rated: bool,
-    ) -> Result<String, String> {
+    fn start_game(&mut self, cfg: &LeagueConfig, names: [String; 2], sfen: String, rated: bool) -> Result<String, String> {
+        let game_name = cfg.name.clone();
         let referee = (|| {
             let mut r = self.backend.create()?;
-            r.set_rules(if parsed.jcsa { Rules::Jcsa } else { Rules::Lishogi })?;
+            r.set_rules(cfg.rules.referee())?;
             r.set_sfen(&sfen)?;
             Ok::<_, chu_rules::Error>(r)
         })();
@@ -431,7 +426,7 @@ impl Lobby {
             PlayerSlot { name: n.clone(), conn: p.map(|p| p.conn.clone()), ctl: p.map(|p| p.ctl.clone()) }
         };
         let players = [slot(&names[0]), slot(&names[1])];
-        let tc = TimeControl::from_game_name(&parsed, TimeUnit::Msec);
+        let tc = cfg.time_control(TimeUnit::Msec);
         // The sessions route game lines before the summary goes out.
         let (tx, rx) = mpsc::unbounded_channel();
         for (i, n) in names.iter().enumerate() {
@@ -443,7 +438,8 @@ impl Lobby {
         game::spawn_with(
             GameSetup {
                 id: id.clone(),
-                name: parsed,
+                league: game_name.clone(),
+                rules: cfg.rules,
                 initial_sfen,
                 tc,
                 rated,

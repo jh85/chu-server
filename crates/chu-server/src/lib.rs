@@ -85,7 +85,7 @@ pub struct Config {
     /// sqlx URL, e.g. `sqlite://chu.db` or `sqlite::memory:`.
     pub db_url: String,
     pub records_dir: PathBuf,
-    /// Floodgate leagues to schedule (`leagues.toml`).
+    /// The league list (`leagues.toml`): every game the server plays.
     pub leagues: Vec<league::LeagueConfig>,
 }
 

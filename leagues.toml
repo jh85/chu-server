@@ -1,12 +1,36 @@
-# Floodgate leagues (DESIGN.md "Floodgate scheduling"). A round every
-# `every_min` minutes, offset `offset_min` from the hour (UTC); players who
-# queue in the last `cutoff_s` seconds before a round wait for the next one.
-# Lishogi rules only: JCSA leagues are deferred.
+# Every game the server plays belongs to one of these leagues; %%GAME with
+# any other name is rejected. The name is a label only. Fields: see
+# crates/chu-server/src/league.rs.
 
 [[league]]
-name = "chu-floodgate-600-10F"
+name = "floodgate-600-10F"
+kind = "floodgate"
+total_s = 600
+byoyomi_s = 0
+increment_s = 10
+rules = "lishogi"
+rated = true
 every_min = 30
 offset_min = 0
 cutoff_s = 15
+
+[[league]]
+name = "floodgate-60-1F"
+kind = "floodgate"
+total_s = 60
+byoyomi_s = 0
+increment_s = 1
 rules = "lishogi"
 rated = true
+every_min = 5
+offset_min = 0
+cutoff_s = 5
+
+[[league]]
+name = "test"
+kind = "test"
+total_s = 60
+byoyomi_s = 0
+increment_s = 1
+rules = "lishogi"
+rated = false

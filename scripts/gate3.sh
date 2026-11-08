@@ -15,7 +15,7 @@
 # threads each, and its own time model.
 #
 # Usage: scripts/gate3.sh [OUT_DIR]
-# env: HOURS (48), LEAGUES (leagues.toml), LEAGUE (chu-floodgate-600-10F),
+# env: HOURS (48), LEAGUES (leagues.toml), LEAGUE (floodgate-600-10F),
 #      PYTHON (python3, with torch), PORT (14084), EVAL_PORT (51610, and +1),
 #      SIMS (1024), THREADS (12)
 # Writes OUT/DONE with the exit status when finished.
@@ -24,7 +24,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-$(mktemp -d)}
 HOURS=${HOURS:-48}
 LEAGUES=${LEAGUES:-$ROOT/leagues.toml}
-LEAGUE=${LEAGUE:-chu-floodgate-600-10F}
+LEAGUE=${LEAGUE:-floodgate-600-10F}
 PYTHON=${PYTHON:-python3}
 PORT=${PORT:-14084}
 EVAL_PORT=${EVAL_PORT:-51610}
@@ -59,7 +59,7 @@ done
 
 START=$(date +%s)
 "$BIN/chu-server" --listen "127.0.0.1:$PORT" --db "sqlite://$OUT/chu.db" --records "$OUT/records" \
-  --leagues "$OUT/leagues.toml" 2> "$OUT/server.log" &
+  --leagues "$OUT/leagues.toml" --http 127.0.0.1:0 2> "$OUT/server.log" &
 server=$!
 pids+=($server)
 for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break; sleep 0.1; done

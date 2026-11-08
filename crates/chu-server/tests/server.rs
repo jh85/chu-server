@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chu_rules::Backend;
-use chu_server::league::LeagueConfig;
+use chu_server::league;
 use chu_server::lobby::LobbyMsg;
 use chu_server::{store, Config, Server};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -13,6 +13,48 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 
 const SFEN: &str = "g10k/12/12/12/12/11R/12/12/12/12/12/K11 b - 1";
+
+/// The test server's league list. The floodgate league runs daily, so the
+/// scheduler stays out of the tests; they send rounds.
+const LEAGUES: &str = r#"
+[[league]]
+name = "floodgate-60-1F"
+kind = "floodgate"
+total_s = 60
+byoyomi_s = 0
+increment_s = 1
+rules = "lishogi"
+rated = true
+every_min = 1440
+cutoff_s = 5
+
+[[league]]
+name = "rapid"
+kind = "challenge"
+total_s = 600
+byoyomi_s = 0
+increment_s = 10
+rules = "lishogi"
+rated = false
+
+[[league]]
+name = "blitz"
+kind = "challenge"
+total_s = 30
+byoyomi_s = 10
+increment_s = 0
+rules = "jcsa"
+rated = true
+
+[[league]]
+name = "test"
+kind = "test"
+total_s = 60
+byoyomi_s = 0
+increment_s = 1
+rules = "lishogi"
+rated = false
+"#;
 
 struct TestServer {
     addr: std::net::SocketAddr,
@@ -29,15 +71,7 @@ async fn server(test: &str) -> TestServer {
         referee: Backend::Ffi,
         db_url: format!("sqlite://{}", dir.join("chu.db").display()),
         records_dir: dir.join("records"),
-        // Daily, so the scheduler stays out of the tests; they send rounds.
-        leagues: vec![LeagueConfig {
-            name: "chu-floodgate-60-1F".into(),
-            every_min: 1440,
-            offset_min: 0,
-            cutoff_s: 5,
-            rules: "lishogi".into(),
-            rated: true,
-        }],
+        leagues: league::parse(LEAGUES).unwrap(),
     };
     let server = Server::start(cfg).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -129,12 +163,17 @@ async fn login_rules_and_second_login() {
 async fn lobby_errors() {
     let ts = server("lobby").await;
     let mut a = Client::login(&ts, "alice").await;
+    let sfen = "11k/12/12/12/12/12/12/12/12/12/12/K11 b - 1";
     for (line, err) in [
-        ("%%GAME chu-floodgate-600-10F *", "##[ERROR] no floodgate league chu-floodgate-600-10F"),
-        ("%%GAME chu-floodgate-60-1F +", "##[ERROR] floodgate leagues take * only"),
-        ("%%GAME chu-blitz-60-1F + 11k/12/12/12/12/12/12/12/12/12/12/K11 b - 1", "##[ERROR] a start SFEN is only allowed in chu-test leagues"),
-        ("%%GAME chu-blitz-060-1F +", "##[ERROR] bad game name chu-blitz-060-1F"),
-        ("%%SHOW nosuchgame", "##[ERROR] no such game nosuchgame"),
+        // Only names in the league list; the old self-describing names are just unknown.
+        ("%%GAME floodgate-600-10F *", "##[ERROR] unknown league floodgate-600-10F".to_owned()),
+        ("%%GAME chu-test-60-1F *", "##[ERROR] unknown league chu-test-60-1F".into()),
+        ("%%GAME chu-floodgate-60-1F *", "##[ERROR] unknown league chu-floodgate-60-1F".into()),
+        ("%%GAME Test *", "##[ERROR] unknown league Test".into()),
+        ("%%GAME floodgate-60-1F +", "##[ERROR] floodgate leagues take * only".into()),
+        (&format!("%%GAME rapid + {sfen}"), "##[ERROR] a start SFEN is only allowed in test leagues".into()),
+        (&format!("%%GAME floodgate-60-1F * {sfen}"), "##[ERROR] a start SFEN is only allowed in test leagues".into()),
+        ("%%SHOW nosuchgame", "##[ERROR] no such game nosuchgame".into()),
     ] {
         a.send(line).await;
         assert_eq!(a.recv().await, err);
@@ -142,22 +181,61 @@ async fn lobby_errors() {
 }
 
 #[tokio::test]
+async fn challenge_league_pairs_the_first_two_whose_colours_fit() {
+    let ts = server("challenge").await;
+    let mut a = Client::login(&ts, "alice").await;
+    let mut b = Client::login(&ts, "bob").await;
+    let mut c = Client::login(&ts, "carol").await;
+    // alice and bob both want sente: no pair. carol takes either colour and
+    // pairs with alice, who queued first; bob keeps waiting.
+    a.send("%%GAME blitz +").await;
+    b.send("%%GAME blitz +").await;
+    c.send("%%GAME blitz *").await;
+    let sa = a.until("END Game_Summary").await;
+    let sc = c.until("END Game_Summary").await;
+    let id = sa.iter().find_map(|l| l.strip_prefix("Game_ID:")).unwrap().to_owned();
+    assert!(id.starts_with("blitz+alice+carol+"), "{id}");
+    assert!(sa.contains(&"Your_Turn:+".to_owned()) && sc.contains(&"Your_Turn:-".to_owned()));
+    // The rules and the clock come from leagues.toml, not from the name.
+    for line in ["Rules:jcsa", "Total_Time:30000", "Byoyomi:10000", "Increment:0"] {
+        assert!(sa.contains(&line.to_owned()), "{line}: {sa:?}");
+    }
+    b.send("%%WHO").await;
+    let who = b.until("##[WHO] +OK").await;
+    assert!(who.contains(&"##[WHO] bob waiting blitz +".to_owned()), "{who:?}");
+    a.send("AGREE").await;
+    c.send("AGREE").await;
+    a.recv().await;
+    c.recv().await;
+    c.send("%TORYO").await;
+    a.until("#WIN").await;
+    store::sync(&ts.server.store).await;
+    let pool = store::open(&format!("sqlite://{}", ts.dir.join("chu.db").display())).await.unwrap();
+    let row: (String, String, i64) =
+        sqlx::query_as("SELECT league, rules, rated FROM games WHERE id = ?").bind(&id).fetch_one(&pool).await.unwrap();
+    assert_eq!(row, ("blitz".into(), "jcsa".into(), 1));
+    // A rated challenge league gets standings.
+    let (_, _, page) = http_get(&ts, "/league/blitz").await;
+    assert!(page.contains("/player/alice") && page.contains("/player/carol"), "{page}");
+}
+
+#[tokio::test]
 async fn full_game_from_sfen_with_records() {
     let ts = server("game").await;
     let mut a = Client::login(&ts, "alice").await;
     let mut b = Client::login(&ts, "bob").await;
-    a.send(&format!("%%GAME chu-test-60-1F + {SFEN}")).await;
+    a.send(&format!("%%GAME test + {SFEN}")).await;
     // Same game name, different SFEN: no match.
-    b.send("%%GAME chu-test-60-1F -").await;
+    b.send("%%GAME test -").await;
     b.send("%%WHO").await;
     let who = b.until("##[WHO] +OK").await;
-    assert_eq!(who[0], "##[WHO] alice waiting chu-test-60-1F +");
-    b.send(&format!("%%GAME chu-test-60-1F - {SFEN}")).await;
+    assert_eq!(who[0], "##[WHO] alice waiting test +");
+    b.send(&format!("%%GAME test - {SFEN}")).await;
 
     let sa = a.until("END Game_Summary").await;
     let sb = b.until("END Game_Summary").await;
     let id = sa.iter().find_map(|l| l.strip_prefix("Game_ID:")).unwrap().to_owned();
-    assert!(id.starts_with("chu-test-60-1F+alice+bob+"));
+    assert!(id.starts_with("test+alice+bob+"));
     assert!(sa.contains(&"Your_Turn:+".to_owned()) && sb.contains(&"Your_Turn:-".to_owned()));
     assert!(sa.contains(&format!("SFEN:{SFEN}")));
     a.send("AGREE").await;
@@ -181,8 +259,8 @@ async fn full_game_from_sfen_with_records() {
     assert_eq!(m.recv().await, format!("##[MONITOR][{id}] #ROYALS_LOST"));
 
     // Back in the lobby: a new challenge pairs again.
-    a.send("%%GAME chu-test-60-1F *").await;
-    b.send("%%GAME chu-test-60-1F *").await;
+    a.send("%%GAME test *").await;
+    b.send("%%GAME test *").await;
     let id2 = a.until("Game_ID:").await.pop().unwrap();
     assert_ne!(id2, format!("Game_ID:{id}"));
 
@@ -196,7 +274,7 @@ async fn full_game_from_sfen_with_records() {
             .unwrap();
     assert_eq!((row.0.as_str(), row.1.as_str(), row.2, row.3.as_str()), ("+", "#ROYALS_LOST", 1, SFEN));
     let rec = PathBuf::from(&row.4);
-    assert!(rec.starts_with(ts.dir.join("records/chu-test-60-1F")));
+    assert!(rec.starts_with(ts.dir.join("records/test")));
     assert_eq!(std::fs::read_to_string(rec.join("moves.usi")).unwrap(), "1f1a\n");
     assert_eq!(std::fs::read_to_string(rec.join("positions.sfen")).unwrap().lines().count(), 2);
     let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(rec.join("record.json")).unwrap()).unwrap();
@@ -213,8 +291,8 @@ async fn reconnect_resumes_with_moves() {
     let ts = server("resume").await;
     let mut a = Client::login(&ts, "alice").await;
     let mut b = Client::login(&ts, "bob").await;
-    a.send("%%GAME chu-test-600-10F +").await;
-    b.send("%%GAME chu-test-600-10F -").await;
+    a.send("%%GAME rapid +").await;
+    b.send("%%GAME rapid -").await;
     a.until("END Game_Summary").await;
     b.until("END Game_Summary").await;
     a.send("AGREE").await;
@@ -227,7 +305,7 @@ async fn reconnect_resumes_with_moves() {
     drop(b);
 
     let mut b = Client::login(&ts, "bob").await;
-    b.send("%%GAME chu-test-600-10F -").await;
+    b.send("%%GAME rapid -").await;
     let summary = b.until("END Game_Summary").await;
     let moves: Vec<&String> = summary.iter().filter(|l| l.starts_with("MOVES:")).collect();
     assert_eq!(moves.len(), 1);
@@ -248,12 +326,12 @@ async fn long_line_closes_connection() {
     assert_eq!(a.recv().await, "<EOF>");
 }
 
-/// Two logged-in players in a started chu-test-600-10F game.
+/// Two logged-in players in a started rapid game.
 async fn started(ts: &TestServer) -> (Client, Client) {
     let mut a = Client::login(ts, "alice").await;
     let mut b = Client::login(ts, "bob").await;
-    a.send("%%GAME chu-test-600-10F +").await;
-    b.send("%%GAME chu-test-600-10F -").await;
+    a.send("%%GAME rapid +").await;
+    b.send("%%GAME rapid -").await;
     a.until("END Game_Summary").await;
     b.until("END Game_Summary").await;
     a.send("AGREE").await;
@@ -320,16 +398,16 @@ async fn floodgate_round_pairs_the_pool_and_rates_the_games() {
     let mut cs = Vec::new();
     for n in names {
         let mut c = Client::login(&ts, n).await;
-        c.send("%%GAME chu-floodgate-60-1F *").await;
+        c.send("%%GAME floodgate-60-1F *").await;
         cs.push(c);
     }
     // Syncs with the lobby: every %%GAME before has been handled.
     cs[0].send("%%WHO").await;
     let who = cs[0].until("##[WHO] +OK").await;
-    assert_eq!(who.iter().filter(|l| l.ends_with("waiting chu-floodgate-60-1F *")).count(), 5, "{who:?}");
+    assert_eq!(who.iter().filter(|l| l.ends_with("waiting floodgate-60-1F *")).count(), 5, "{who:?}");
 
     // Queued less than the cutoff (5 s) before the round: nobody plays.
-    let league = "chu-floodgate-60-1F".to_owned();
+    let league = "floodgate-60-1F".to_owned();
     let now = std::time::SystemTime::now();
     let cutoff = |t: std::time::SystemTime| t - Duration::from_secs(5);
     ts.server.lobby.send(LobbyMsg::Round { league: league.clone(), scheduled_at: now, cutoff: cutoff(now) }).unwrap();
@@ -379,7 +457,7 @@ async fn floodgate_round_pairs_the_pool_and_rates_the_games() {
     assert!(!playing.iter().any(|&i| names[i] == sat_out));
 
     let ratings: Vec<(String, f64, i64)> =
-        sqlx::query_as("SELECT player, rating, games FROM ratings WHERE league = 'chu-floodgate-60-1F' ORDER BY player")
+        sqlx::query_as("SELECT player, rating, games FROM ratings WHERE league = 'floodgate-60-1F' ORDER BY player")
             .fetch_all(&pool)
             .await
             .unwrap();
@@ -485,7 +563,7 @@ async fn web_pages_records_api_and_live_stream() {
     let (status, _, page) = http_get(&ts, &format!("/game/{id}")).await;
     assert_eq!(status, 200);
     assert!(page.contains("1–0 resign after 1 plies"), "{page}");
-    let (status, kind, json) = http_get(&ts, "/api/games?league=chu-test-600-10F").await;
+    let (status, kind, json) = http_get(&ts, "/api/games?league=rapid").await;
     assert_eq!((status, kind.as_str()), (200, "application/json"));
     let games: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(games.as_array().unwrap().len(), 1);
@@ -505,17 +583,18 @@ async fn web_pages_records_api_and_live_stream() {
     let (status, _, usi) = http_get(&ts, &format!("{record}moves.usi")).await;
     assert_eq!((status, usi.as_str()), (200, "8i8h\n"));
     let (status, _, listing) = http_get(&ts, "/records/").await;
-    assert!(status == 200 && listing.contains("chu-test-600-10F/"), "{listing}");
-    for bad in ["/records/../chu.db", "/records/%2e%2e/chu.db", "/records/chu-test-600-10F/../../chu.db"] {
+    assert!(status == 200 && listing.contains("rapid/"), "{listing}");
+    for bad in ["/records/../chu.db", "/records/%2e%2e/chu.db", "/records/rapid/../../chu.db"] {
         assert_eq!(http_get(&ts, bad).await.0, 404, "{bad}");
     }
 
     // The other pages.
     for (path, want) in [
-        ("/", "chu-test-600-10F"),
-        ("/league/chu-test-600-10F", "alice"),
-        ("/league/chu-test-600-10F/standings", "hx-get"),
-        ("/league/chu-floodgate-60-1F", "a round every 1440 min"),
+        ("/", "rapid"),
+        ("/league/rapid", "alice"),
+        ("/league/rapid/standings", "hx-get"),
+        ("/league/floodgate-60-1F", "a round every 1440 min"),
+        ("/league/blitz", "30 s + 10 s byoyomi · on demand, JCSA rules"),
         ("/player/alice", "bob"),
         ("/live", "Online"),
     ] {
@@ -523,7 +602,7 @@ async fn web_pages_records_api_and_live_stream() {
         assert_eq!(status, 200, "{path}");
         assert!(body.contains(want), "{path}: {body}");
     }
-    let (status, kind, svg) = http_get(&ts, "/league/chu-test-600-10F/rating.svg").await;
+    let (status, kind, svg) = http_get(&ts, "/league/rapid/rating.svg").await;
     assert_eq!((status, kind.as_str()), (200, "image/svg+xml; charset=utf-8"));
     assert!(svg.contains("<svg") && svg.contains("No rated games yet"));
     for path in ["/league/nope-1-1", "/game/nope", "/player/nobody", "/records/nope", "/static/nope.js", "/nope"] {

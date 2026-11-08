@@ -46,7 +46,7 @@ fn game_summary_example() {
     let s = GameSummary::parse(summary_lines).unwrap();
     assert_eq!(s.format, "Chushogi 1.0");
     assert_eq!(s.rules, "lishogi");
-    assert_eq!(s.game_id, "chu-floodgate-600-10F+az_v12+random_bot+20261104213000");
+    assert_eq!(s.game_id, "floodgate-600-10F+az_v12+random_bot+20261104213000");
     assert_eq!((s.name_plus.as_str(), s.name_minus.as_str()), ("az_v12", "random_bot"));
     assert_eq!((s.your_turn, s.to_move), (Side::Sente, Side::Sente));
     assert!(!s.rematch_on_draw);
@@ -60,9 +60,8 @@ fn game_summary_example() {
     // Encoding gives back the spec's lines exactly.
     assert_eq!(s.to_lines(), summary_lines);
 
-    // The game name inside the Game_ID follows the §3 grammar.
-    let name: GameName = s.game_id.split('+').next().unwrap().parse().unwrap();
-    assert_eq!((name.league.as_str(), name.total_s, name.byoyomi_s, name.fischer, name.jcsa), ("floodgate", 600, 10, true, false));
+    // The Game_ID starts with the league's label (§3, §4).
+    assert!(s.game_id.starts_with("floodgate-600-10F+az_v12+random_bot+"));
 
     // Then the client agrees and the server starts the game.
     let rest: Vec<(char, &str)> = block.iter().map(|l| wire(l)).skip_while(|(_, b)| *b != "END Game_Summary").skip(1).collect();
@@ -117,17 +116,14 @@ fn reason_table() {
 }
 
 #[test]
-fn game_name_examples() {
-    let a: GameName = "chu-floodgate-600-10F".parse().unwrap();
-    assert!(SPEC.contains("`chu-floodgate-600-10F` = 600 s + 10 s Fischer, lishogi rules"));
-    assert_eq!((a.total_s, a.byoyomi_s, a.fischer, a.rules()), (600, 10, true, "lishogi"));
-    let b: GameName = "chu-floodgate-900-30-jcsa".parse().unwrap();
-    assert!(SPEC.contains("`chu-floodgate-900-30-jcsa` = 900 s + 30 s byoyomi, JCSA rules"));
-    assert_eq!((b.total_s, b.byoyomi_s, b.fischer, b.rules()), (900, 30, false, "jcsa"));
-    let t: GameName = "chu-test-60-1F".parse().unwrap();
-    assert!(t.is_test() && !t.is_floodgate());
-    for bad in ["chu-test-60", "chu-test-060-1F", "shogi-test-60-1", "chu--60-1", "chu-test-60-1f", "chu-test-60-1F-lishogi", "chu-te st-60-1"] {
-        assert!(bad.parse::<GameName>().is_err(), "{bad}");
+fn league_names() {
+    // A game name is an opaque label from the server's league list (§3).
+    assert!(SPEC.contains("A game name is a label from the server's league list"));
+    for good in ["floodgate-600-10F", "test", "A_b-9", &"x".repeat(32)] {
+        assert!(valid_name(good), "{good}");
+    }
+    for bad in ["", "chu test", "floodgate/600", "ü", &"x".repeat(33)] {
+        assert!(!valid_name(bad), "{bad}");
     }
 }
 
@@ -136,8 +132,8 @@ fn client_lines() {
     use ClientMsg::*;
     let sfen = "11k/12/12/12/12/12/12/12/12/12/12/K11 b - 1";
     let cases = [
-        ("%%GAME chu-test-60-1F *", Game { game_name: "chu-test-60-1F".into(), color: ColorReq::Any, sfen: None }),
-        (&format!("%%GAME chu-test-60-1F + {sfen}"), Game { game_name: "chu-test-60-1F".into(), color: ColorReq::Sente, sfen: Some(sfen.into()) }),
+        ("%%GAME test *", Game { game_name: "test".into(), color: ColorReq::Any, sfen: None }),
+        (&format!("%%GAME test + {sfen}"), Game { game_name: "test".into(), color: ColorReq::Sente, sfen: Some(sfen.into()) }),
         ("%%CHAT hello  wörld", Chat("hello  wörld".into())),
         ("%%MONITORON g1", MonitorOn("g1".into())),
         ("AGREE g1", Agree(Some("g1".into()))),

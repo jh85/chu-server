@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use chu_rules::Backend;
+use chu_server::league::{Kind, LeagueConfig};
 use chu_server::{Config, Server};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -18,7 +19,11 @@ async fn start_server(dir: &std::path::Path) -> std::net::SocketAddr {
         referee: Backend::Ffi,
         db_url: format!("sqlite://{}", dir.join("chu.db").display()),
         records_dir: dir.join("records"),
-        leagues: vec![],
+        leagues: vec![
+            LeagueConfig::on_demand("test", Kind::Test, 60, 0, 1),
+            // 2 s + 1 s byoyomi: the server allows 3 s for the first move.
+            LeagueConfig::on_demand("stall", Kind::Challenge, 2, 1, 0),
+        ],
     };
     let server = Server::start(cfg).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -69,7 +74,7 @@ async fn start_proxy(upstream: std::net::SocketAddr, cut_after: usize) -> std::n
 }
 
 fn bridge(server: std::net::SocketAddr, name: &str, color: &str, seed: u32) -> Command {
-    let mut c = bridge_for(server, name, color, "chu-test-60-1F", 2);
+    let mut c = bridge_for(server, name, color, "test", 2);
     c.args(["--engine", chu_rules::BUILT_CHUSHOGI_GEN, "--usi-option", &format!("Seed={seed}")]);
     c
 }
@@ -143,7 +148,7 @@ async fn a_hung_engine_is_stopped_before_the_server_limit() {
     std::fs::create_dir_all(&dir).unwrap();
     let addr = start_server(&dir).await;
     // 2 s + 1 s byoyomi: the server allows 3 s for the first move.
-    let game = "chu-test-2-1";
+    let game = "stall";
     let mut stall = bridge_for(addr, "stall", "+", game, 1);
     stall.args(["--engine", "sh", "--engine-arg", "-c", "--engine-arg", STALLING_ENGINE]);
     let mut random = bridge_for(addr, "random", "-", game, 1);

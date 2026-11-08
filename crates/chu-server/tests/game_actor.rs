@@ -4,9 +4,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use chu_proto::{ClientMsg, GameName, GameSummary, ResumedClock, Side, TimeUnit};
+use chu_proto::{ClientMsg, GameSummary, ResumedClock, Side, TimeUnit};
 use chu_rules::{Backend, GameEnd, START_SFEN};
 use chu_server::clock::TimeControl;
+use chu_server::league::RuleSet;
 use chu_server::game::{self, GameInput, GameSetup, GameTx, PlayerSlot};
 use chu_server::lobby::LobbyMsg;
 use chu_server::store::StoreMsg;
@@ -14,7 +15,7 @@ use chu_server::{Conn, Ctl, OutMsg};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::time::{sleep, Instant};
 
-const ID: &str = "chu-test-60-1F+a+b+20261105000000";
+const ID: &str = "test+a+b+20261105000000";
 
 struct Harness {
     tx: GameTx,
@@ -29,8 +30,8 @@ fn idx(s: Side) -> usize {
     if s == Side::Sente { 0 } else { 1 }
 }
 
-fn setup(game_name: &str, sfen: &str) -> Harness {
-    let name: GameName = game_name.parse().unwrap();
+/// A game at `total_s` + `byoyomi_s` byoyomi / `increment_s` Fischer.
+fn setup((total_s, byoyomi_s, increment_s): (u64, u64, u64), sfen: &str) -> Harness {
     let mut referee = Backend::Ffi.create().unwrap();
     referee.set_sfen(sfen).unwrap();
     let (c0, o0) = Conn::new(1);
@@ -41,8 +42,9 @@ fn setup(game_name: &str, sfen: &str) -> Harness {
     let (lobby, lobby_rx) = unbounded_channel();
     let tx = game::spawn(GameSetup {
         id: ID.into(),
-        tc: TimeControl::from_game_name(&name, TimeUnit::Msec),
-        name,
+        tc: TimeControl::from_secs(total_s, byoyomi_s, increment_s, TimeUnit::Msec),
+        league: "test".into(),
+        rules: RuleSet::Lishogi,
         initial_sfen: referee.sfen().unwrap(),
         rated: false,
         players: [
@@ -139,7 +141,7 @@ async fn referee_endings() {
         ("11k/12/12/12/6g5/6K5/12/12/12/12/12/12 b - 1", "6f6e", r("#INSUFFICIENT", "#DRAW", "#DRAW")),
     ];
     for (sfen, mv, want) in cases {
-        let mut h = setup("chu-test-60-1F", sfen);
+        let mut h = setup((60, 0, 1), sfen);
         h.start().await;
         h.play(S, mv).await;
         assert_eq!(h.result().await, want, "{sfen}");
@@ -151,7 +153,7 @@ async fn referee_endings() {
 
 #[tokio::test(start_paused = true)]
 async fn sennichite() {
-    let mut h = setup("chu-test-60-1F", "10gk/12/12/12/12/12/12/12/12/12/12/KG10 b - 1");
+    let mut h = setup((60, 0, 1), "10gk/12/12/12/12/12/12/12/12/12/12/KG10 b - 1");
     h.start().await;
     for _ in 0..3 {
         for (side, mv) in [(S, "12l12k"), (G, "1a1b"), (S, "12k12l"), (G, "1b1a")] {
@@ -165,7 +167,7 @@ async fn sennichite() {
 #[tokio::test(start_paused = true)]
 async fn perpetual_check_loses() {
     // Sente's rook checks on every move; gote's king steps between 1a and 2a.
-    let mut h = setup("chu-test-60-1F", "g10k/12/10R1/12/12/12/12/12/12/12/12/K11 b - 1");
+    let mut h = setup((60, 0, 1), "g10k/12/10R1/12/12/12/12/12/12/12/12/K11 b - 1");
     h.start().await;
     for _ in 0..3 {
         for (side, mv) in [(S, "2c1c"), (G, "1a2a"), (S, "1c2c"), (G, "2a1a")] {
@@ -178,7 +180,7 @@ async fn perpetual_check_loses() {
 
 #[tokio::test(start_paused = true)]
 async fn resign_illegal_wrong_turn_wrong_colour() {
-    let mut h = setup("chu-test-60-1F", START_SFEN);
+    let mut h = setup((60, 0, 1), START_SFEN);
     h.start().await;
     h.play(S, "8i8h").await;
     h.send(G, "%TORYO");
@@ -191,7 +193,7 @@ async fn resign_illegal_wrong_turn_wrong_colour() {
         (G, "-6c5e", r("#ILLEGAL_MOVE", "#WIN", "#LOSE")),  // out of turn
         (S, "-8i8h", r("#ILLEGAL_MOVE", "#LOSE", "#WIN")),  // wrong colour prefix
     ] {
-        let mut h = setup("chu-test-60-1F", START_SFEN);
+        let mut h = setup((60, 0, 1), START_SFEN);
         h.start().await;
         h.send(side, line);
         assert_eq!(h.result().await, want, "{line}");
@@ -201,7 +203,7 @@ async fn resign_illegal_wrong_turn_wrong_colour() {
 
 #[tokio::test(start_paused = true)]
 async fn time_up_on_main_time() {
-    let mut h = setup("chu-test-60-1F", START_SFEN);
+    let mut h = setup((60, 0, 1), START_SFEN);
     h.start().await;
     let t0 = Instant::now();
     assert_eq!(h.result().await, r("#TIME_UP", "#LOSE", "#WIN"));
@@ -211,7 +213,7 @@ async fn time_up_on_main_time() {
 #[tokio::test(start_paused = true)]
 async fn byoyomi_accounting() {
     // 10 s + 5 s byoyomi: moves within 5 s are free; the main clock pays the rest.
-    let mut h = setup("chu-test-10-5", START_SFEN);
+    let mut h = setup((10, 5, 0), START_SFEN);
     let sum = h.summary(S).await;
     assert_eq!((sum.time.total_time, sum.time.byoyomi, sum.time.increment), (10_000, 5_000, 0));
     h.summary(G).await;
@@ -234,7 +236,7 @@ async fn byoyomi_accounting() {
 #[tokio::test(start_paused = true)]
 async fn fischer_accounting() {
     // 1 s + 1 s increment.
-    let mut h = setup("chu-test-1-1F", START_SFEN);
+    let mut h = setup((1, 0, 1), START_SFEN);
     h.start().await;
     sleep(Duration::from_millis(900)).await;
     assert_eq!(h.play(S, "8i8h").await, 900); // 0.1 + 1 = 1.1 s left
@@ -249,7 +251,7 @@ async fn fischer_accounting() {
 
 #[tokio::test(start_paused = true)]
 async fn late_move_is_time_up_not_applied() {
-    let mut h = setup("chu-test-1-1F", START_SFEN);
+    let mut h = setup((1, 0, 1), START_SFEN);
     h.start().await;
     // A move stamped after the deadline loses even if it reaches the actor first.
     let late = Instant::now() + Duration::from_millis(1_001);
@@ -260,7 +262,7 @@ async fn late_move_is_time_up_not_applied() {
 
 #[tokio::test(start_paused = true)]
 async fn reject_and_agree_timeout() {
-    let mut h = setup("chu-test-60-1F", START_SFEN);
+    let mut h = setup((60, 0, 1), START_SFEN);
     h.summary(S).await;
     h.summary(G).await;
     h.send(S, "AGREE");
@@ -270,7 +272,7 @@ async fn reject_and_agree_timeout() {
     assert!(matches!(h.lobby.recv().await, Some(LobbyMsg::GameEnded { .. })));
     assert!(h.store.try_recv().is_err(), "a cancelled game is not stored");
 
-    let mut h = setup("chu-test-60-1F", START_SFEN);
+    let mut h = setup((60, 0, 1), START_SFEN);
     h.summary(S).await;
     h.summary(G).await;
     h.send(G, "AGREE");
@@ -280,7 +282,7 @@ async fn reject_and_agree_timeout() {
 
     // A move before START is out of place; no game is in progress, so it
     // cancels like REJECT.
-    let mut h = setup("chu-test-60-1F", START_SFEN);
+    let mut h = setup((60, 0, 1), START_SFEN);
     h.summary(S).await;
     h.summary(G).await;
     h.send(S, "+8i8h");
@@ -291,7 +293,7 @@ async fn reject_and_agree_timeout() {
 async fn thousand_plies_is_max_moves() {
     // A driver with its own referee plays pseudo-random moves that neither end
     // the game nor repeat a position four times.
-    let mut h = setup("chu-test-60-1F", START_SFEN);
+    let mut h = setup((60, 0, 1), START_SFEN);
     h.start().await;
     let mut me = Backend::Ffi.create().unwrap();
     let mut seen: HashMap<String, u32> = HashMap::new();
@@ -326,7 +328,7 @@ async fn thousand_plies_is_max_moves() {
 
 #[tokio::test(start_paused = true)]
 async fn disconnect_and_resume() {
-    let mut h = setup("chu-test-60-1F", START_SFEN);
+    let mut h = setup((60, 0, 1), START_SFEN);
     h.start().await;
     h.play(S, "8i8h").await;
     h.play(G, "6c5e").await;
@@ -359,7 +361,7 @@ async fn disconnect_and_resume() {
 
 #[tokio::test(start_paused = true)]
 async fn disconnected_player_loses_on_time() {
-    let mut h = setup("chu-test-60-1F", START_SFEN);
+    let mut h = setup((60, 0, 1), START_SFEN);
     h.start().await;
     h.play(S, "8i8h").await;
     h.tx.send(GameInput::Disconnected { side: G, conn_id: h.conn_ids[1] }).unwrap();
@@ -375,14 +377,14 @@ async fn disconnected_player_loses_on_time() {
 #[tokio::test(start_paused = true)]
 async fn commands_out_of_place_are_illegal_action() {
     // AGREE (or REJECT) during play.
-    let mut h = setup("chu-test-60-1F", START_SFEN);
+    let mut h = setup((60, 0, 1), START_SFEN);
     h.start().await;
     h.play(S, "8i8h").await;
     h.send(S, "AGREE");
     assert_eq!(h.result().await, r("#ILLEGAL_ACTION", "#LOSE", "#WIN"));
 
     // A move from a resumed player before it answered the summary.
-    let mut h = setup("chu-test-60-1F", START_SFEN);
+    let mut h = setup((60, 0, 1), START_SFEN);
     h.start().await;
     h.play(S, "8i8h").await;
     h.tx.send(GameInput::Disconnected { side: G, conn_id: h.conn_ids[1] }).unwrap();
@@ -397,7 +399,7 @@ async fn commands_out_of_place_are_illegal_action() {
 
 #[tokio::test(start_paused = true)]
 async fn violation_is_illegal_action_and_monitors_see_moves() {
-    let mut h = setup("chu-test-60-1F", START_SFEN);
+    let mut h = setup((60, 0, 1), START_SFEN);
     h.start().await;
     let (mon, mut mon_rx) = Conn::new(9);
     h.tx.send(GameInput::Monitor { conn: mon, on: true }).unwrap();

@@ -127,7 +127,7 @@ Protocol_Version:1.2
 Protocol_Mode:Server
 Format:Chushogi 1.0
 Rules:lishogi
-Game_ID:chu-floodgate-600-10F+az_v12+random_bot+20261104213000
+Game_ID:floodgate-600-10F+az_v12+random_bot+20261104213000
 Name+:az_v12
 Name-:random_bot
 Your_Turn:+
@@ -149,7 +149,7 @@ END Game_Summary
 
 A position block may carry `MOVES:` lines after `SFEN:` for a game resumed after a server restart; clients replay them before answering AGREE.
 
-Game-name grammar, in the floodgate style: `chu-<league>-<total-seconds>-<byoyomi-seconds>[F][-jcsa]`. `chu-floodgate-600-10F` is 600 s + 10 s Fischer increment under lishogi rules; `chu-floodgate-900-30-jcsa` is 900 s + 30 s byoyomi under JCSA rules. The scheduler treats each distinct game name as its own league with its own rating list, exactly as floodgate separates `floodgate-300-10F` from `floodgate-600-10`.
+Game names are labels from the server's league list, `leagues.toml` (spec draft 5); nothing parses them. Each `[[league]]` block gives `name` (`[A-Za-z0-9_-]{1,32}`), `kind` (`floodgate`, `challenge` or `test`), `total_s`, `byoyomi_s` and `increment_s` (at most one of the last two above 0), `rules` (`lishogi` or `jcsa`), `rated`, and for floodgate leagues only `every_min`, `offset_min` (default 0) and `cutoff_s`. The time control and rules reach clients only through the Game\_Summary. `%%GAME` with a name not in the file is rejected with `##[ERROR] unknown league <name>`. Each league has its own rating list, as floodgate separates `floodgate-300-10F` from `floodgate-600-10`; the shipped file has `floodgate-600-10F` (600 s + 10 s Fischer, a round every 30 minutes), `floodgate-60-1F` (60 s + 1 s Fischer, every 5 minutes) and `test` (60 s + 1 s Fischer, unrated).
 
 Result reason lines (`#` messages) follow CSA where the meaning matches and add the chu-specific ones:
 
@@ -183,17 +183,17 @@ Move handling in the game actor, per received line:
 6. If the ply count has reached 1000, end with `#MAX_MOVES`.
 7. Echo `+move,T<ms>` to both players and all monitors (every accepted move is echoed, a game-ending one before its result lines), start the opponent's clock from the moment the echo is queued, and append to the record.
 
-Clocks are integers in the league's `Time_Unit`, `1msec` by default (CSA 1.2.1 allows it; `1sec` stays available per league), measured with `tokio::time::Instant` from the moment the previous echo was written to the socket. Milliseconds matter at fast leagues such as 60+1, where whole-second rounding would charge a 0.9 s move zero or one second at random, a systematic bias between engines with different move-time distributions. Two modes, selected by the game name: byoyomi (`Total_Time` then `Byoyomi` per move; a move within byoyomi costs nothing from the main clock) and Fischer (`Increment` added after each move, `Byoyomi:0`). Each clock has a timer task; a timer firing with no move received ends the game with `#TIME_UP`, so a hung engine cannot stall a round.
+Clocks are integers in the league's `Time_Unit`, `1msec` by default (CSA 1.2.1 allows it; `1sec` stays available per league), measured with `tokio::time::Instant` from the moment the previous echo was written to the socket. Milliseconds matter at fast leagues such as 60+1, where whole-second rounding would charge a 0.9 s move zero or one second at random, a systematic bias between engines with different move-time distributions. Two modes, set per league in `leagues.toml`: byoyomi (`Total_Time` then `Byoyomi` per move; a move within byoyomi costs nothing from the main clock) and Fischer (`Increment` added after each move, `Byoyomi:0`). Each clock has a timer task; a timer firing with no move received ends the game with `#TIME_UP`, so a hung engine cannot stall a round.
 
-Rule set is a property of the league (`-jcsa` suffix) and is sent as `Rules:` in Game\_Summary and passed to `chu_set_rules` once per game. Under JCSA the referee already knows that an unpromoted last-rank lance is a dead piece and that bare king needs a counting piece; the server has no rule-set code of its own.
+Rule set is a property of the league (`rules` in `leagues.toml`) and is sent as `Rules:` in Game\_Summary and passed to `chu_set_rules` once per game. Under JCSA the referee already knows that an unpromoted last-rank lance is a dead piece and that bare king needs a counting piece; the server has no rule-set code of its own.
 
-Start position is the standard chu shogi setup for every rated game. A `chu-test-…` league accepts `%%GAME` with an SFEN argument for engine testing; those games are unrated and never appear in standings.
+Start position is the standard chu shogi setup for every rated game. A league of kind `test` accepts `%%GAME` with an SFEN argument for engine testing (both players must give the same one); test leagues are never rated (`rated = true` is a config error) and never appear in standings.
 
 Disconnects: a player whose socket closes mid-game keeps its clock running and loses on `#TIME_UP` if it does not reconnect before the clock expires; a reconnect (same LOGIN, then `%%GAME` with the same name) is attached to the running game and receives the Game\_Summary with `MOVES:` so far. This matches floodgate's practice of letting engines survive a network blip without rewarding a stall, and it is what the AlphaZero workers will need when an inference server restarts.
 
 ## Floodgate scheduling, pairing and rating
 
-Each floodgate league runs rounds on a fixed cadence from `leagues.toml` (`every_min`, `offset_min`, UTC; shogi-server's `floodgate-0-240.conf` idea): `chu-floodgate-600-10F` every 30 minutes, with a 15 s cutoff so late joiners wait for the next one. A round missed while the host was down is fired late only if the next one is not yet due, otherwise skipped with a warning. A game with 600 s + 10 s per side and a 1000-ply cap can in theory run about 3.5 hours, so the scheduler must not assume a round finishes before the next one starts; a player still in a game is simply not in the pool.
+Each floodgate league runs rounds on a fixed cadence from `leagues.toml` (`every_min`, `offset_min`, UTC; shogi-server's `floodgate-0-240.conf` idea): `floodgate-600-10F` every 30 minutes, with a 15 s cutoff so late joiners wait for the next one. A round missed while the host was down is fired late only if the next one is not yet due, otherwise skipped with a warning. A game with 600 s + 10 s per side and a 1000-ply cap can in theory run about 3.5 hours, so the scheduler must not assume a round finishes before the next one starts; a player still in a game is simply not in the pool.
 
 Pairing per round, in order, as floodgate's `Pairing` chain does:
 
@@ -203,7 +203,7 @@ Pairing per round, in order, as floodgate's `Pairing` chain does:
 4. Odd pool: the player who sat out most recently plays, and the one who has sat out least recently sits out (floodgate's `ExcludeUnratedPlayers` and `StartGame` steps). Among ties, the lowest rated sits out, so new engines get games quickly.
 5. Colours alternate per player across rounds; a player who was sente last time gets gote when possible.
 
-A `chu-test` league pairs instantly on demand instead of on a schedule.
+Challenge and test leagues pair on demand instead of on a schedule: the first two queued players whose colour requests (`+`, `-`, `*`) fit play at once.
 
 Rating follows floodgate's `mk_rate`: a Bradley-Terry fit over all rated games in the league, scaled so that a 200-point gap is a 76% expected score, and anchored so the whole list has mean 1500. The fit is regularised with one virtual draw per player against a fixed 1500 opponent, since a pure maximum-likelihood fit sends a player with only losses (the random bot) to minus infinity. Players need 15 rated games before a rating is published (floodgate uses 15). Recompute after every game in a tokio task (a few thousand games fit in milliseconds with a fixed-point iteration), store the current value per player, and keep a history row per recompute so a rating curve per engine can be drawn. A Glicko-2 variant can be added later as a second column; the Bradley-Terry fit is kept because it is what floodgate publishes and what your scaling-law work can compare against.
 
@@ -240,7 +240,7 @@ The live board is the one place that needs chu shogi knowledge in the browser: a
 
 ```
 chu-bridge --server tourney.example:4081 --name az_v12 --password … \
-           --game chu-floodgate-600-10F --engine ./chushogi-az --usi-option EvalPort=5000 \
+           --game floodgate-600-10F --engine ./chushogi-az --usi-option EvalPort=5000 \
            --games 100 --usi-option Sims=1024      # the eval server on EvalPort loads the checkpoint
 ```
 
@@ -330,7 +330,7 @@ Rough size: phases 0–3 are about 4,000 lines of Rust plus 150 lines of C++, so
 
 Decisions that change code in phase 0 or 1 and are worth settling before starting:
 
-- [x] JCSA leagues are deferred (decided 5 Nov): v1 runs lishogi rules only. The engines already take a `Rules` USI option and the bridge sets it from `Rules:`, so turning a `-jcsa` league on later is config plus confirming the JCSA reading of perpetual check.
+- [x] JCSA leagues are deferred (decided 5 Nov): v1 runs lishogi rules only. The engines already take a `Rules` USI option and the bridge sets it from `Rules:`, so a league with `rules = "jcsa"` needs only config; the open point is confirming the JCSA reading of perpetual check before running one.
 - [ ] Jitto (lion pass) spelling in USI: `USI-CHU.md` defers to `chushogi-gen legal` as the normative list; replace that with the literal form once checked against lishogi.
 - [ ] Should the AlphaZero workers' evaluation tournaments (`az/checkpoint_tournament.py`) move onto the server, so every checkpoint comparison is a rated league with a public record? It is the same bridge; only a `chu-ckpt-…` league name and an instant-pairing mode are needed.
 - [ ] Where to host: the same Ubuntu box as the mail server (one more systemd unit behind nginx) or a separate small VM, so a runaway engine cannot touch mail delivery.
@@ -345,6 +345,8 @@ Status 5 Nov 2026: phases 0 and 1 done and both gates pass (commits 5686e86, e0f
 Status 5 Nov 2026, later: draft 2 applied (f316419) and phase 2 done (94291e1), both pushed. Gate: `chushogi-az` with `a0gb_iter_0202.pt` vs `chushogi-gen`, 20 games at 600+10F on CPU (eval server `--cpu`, ~2.5 s per 1024 sims), az won all 20 by `#ROYALS_LOST`, zero time or protocol losses, all 626 az moves matched the engine's `bestmove`, median move 8.9 s. Both engines gained a USI mode on the chushogi branch `usi` (ef10fa7; `chushogi-az` searches on its own thread so `stop` answers at once). Conformance: 10/10 for both engines. Spec draft 3 adds `Remaining+/-:` to resumed summaries, the `Rules` option, and the client-pacing rule. Not yet done: `chu-tools conformance --client` (phase 3).
 
 Status 5 Nov 2026, evening: draft 3 (becf6d5) and phase 3 (e0f155b) done; `chu-tools conformance --client` plays three scripted games (resign, drop and resume, `#CHUDAN` and re-queue). A 36-round rehearsal at 1-minute cadence fired every round within 2 ms and ordered the bots random 1031 < random_mate1 1317 < az_softz 1697 < az_a0gb 1954. The 48-hour gate started 2026-11-05 18:22 UTC with four bots (random, random+mate-in-1 via `MateNodes=1`, az softz_iter_0202, az a0gb_iter_0202, all on CPU); phase 3 is pushed after it passes. Spec draft 4 adds `Turn_Used:` to resumed summaries and the missed-round rule.
+
+Status 8 Nov 2026: phase 4 (9fad159) done, gate passed. Spec draft 5: `leagues.toml` is the only source of truth for every game; league names are opaque labels, `%%GAME` with an unknown name gets `##[ERROR] unknown league <name>`, and the name grammar, the `-jcsa` suffix and the `chu-test-*` special cases are gone. Gates 1 and 4 re-run unchanged (100/100 games, 32,053 positions; the gate-4 game replays), conformance 0 failed in both modes for both engines.
 
 Risks and how the plan contains them:
 

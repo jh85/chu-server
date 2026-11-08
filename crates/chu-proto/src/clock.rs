@@ -4,7 +4,7 @@
 //! afterwards `remaining -= max(0, charged - byoyomi)` and `remaining += increment`.
 //! Byoyomi leagues have `increment = 0`, Fischer leagues `byoyomi = 0`.
 
-use crate::{GameName, TimeConfig, TimeUnit};
+use crate::{TimeConfig, TimeUnit};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimeControl {
@@ -16,13 +16,9 @@ pub struct TimeControl {
 }
 
 impl TimeControl {
-    pub fn from_game_name(name: &GameName, unit: TimeUnit) -> TimeControl {
-        let (byoyomi_ms, increment_ms) = if name.fischer {
-            (0, name.byoyomi_s * 1000)
-        } else {
-            (name.byoyomi_s * 1000, 0)
-        };
-        TimeControl { unit, total_ms: name.total_s * 1000, byoyomi_ms, increment_ms, least_ms: 0 }
+    /// A league's time control, given in seconds.
+    pub fn from_secs(total_s: u64, byoyomi_s: u64, increment_s: u64, unit: TimeUnit) -> TimeControl {
+        TimeControl { unit, total_ms: total_s * 1000, byoyomi_ms: byoyomi_s * 1000, increment_ms: increment_s * 1000, least_ms: 0 }
     }
 
     /// The clock a client reads from a Game_Summary's `BEGIN Time` block
@@ -78,13 +74,9 @@ impl TimeControl {
 mod tests {
     use super::*;
 
-    fn tc(name: &str, unit: TimeUnit) -> TimeControl {
-        TimeControl::from_game_name(&name.parse().unwrap(), unit)
-    }
-
     #[test]
     fn fischer() {
-        let t = tc("chu-test-60-1F", TimeUnit::Msec);
+        let t = TimeControl::from_secs(60, 0, 1, TimeUnit::Msec);
         assert_eq!((t.total_ms, t.byoyomi_ms, t.increment_ms), (60_000, 0, 1000));
         assert_eq!(t.allowance_ms(60_000), 60_000);
         assert_eq!(t.after_move(60_000, 2_500), 58_500);
@@ -97,7 +89,7 @@ mod tests {
 
     #[test]
     fn byoyomi_moves_within_byoyomi_are_free() {
-        let t = tc("chu-floodgate-900-30-jcsa", TimeUnit::Msec);
+        let t = TimeControl::from_secs(900, 30, 0, TimeUnit::Msec);
         assert_eq!((t.byoyomi_ms, t.increment_ms), (30_000, 0));
         assert_eq!(t.after_move(900_000, 29_999), 900_000);
         assert_eq!(t.after_move(900_000, 31_000), 899_000);
@@ -107,7 +99,7 @@ mod tests {
 
     #[test]
     fn whole_seconds() {
-        let t = tc("chu-test-600-10", TimeUnit::Sec);
+        let t = TimeControl::from_secs(600, 10, 0, TimeUnit::Sec);
         assert_eq!(t.charged_ms(999), 0);
         assert_eq!(t.charged_ms(2_999), 2_000);
         assert_eq!(t.units(2_000), 2);

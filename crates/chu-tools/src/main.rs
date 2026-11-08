@@ -32,7 +32,7 @@ enum Cmd {
         name: String,
         #[arg(long, default_value = "random")]
         password: String,
-        #[arg(long, default_value = "chu-test-60-1F")]
+        #[arg(long, default_value = "test")]
         game: String,
         /// `+`, `-` or `*`.
         #[arg(long, default_value = "*")]

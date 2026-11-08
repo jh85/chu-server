@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Phase-1 gate (DESIGN.md): GAMES games of `chushogi-gen go random` against
-# itself at chu-test-60-1F, through the server and two `chu-tools play`
+# itself in the `test` league (60 s + 1 s Fischer), through the server and two `chu-tools play`
 # clients; then every record must pass vendor/chushogi/tests/replay_test.py
 # and agree with random_match.py's referee (scripts/check_results.py).
 #
@@ -10,7 +10,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-$(mktemp -d)}
 GAMES=${GAMES:-100}
 PORT=${PORT:-14082}
-GAME=chu-test-60-1F
+GAME=test
 
 cargo build --release -q --manifest-path "$ROOT/Cargo.toml"
 BIN=$ROOT/target/release
@@ -19,7 +19,7 @@ mkdir -p "$OUT"
 echo "output: $OUT"
 
 "$BIN/chu-server" --listen "127.0.0.1:$PORT" --db "sqlite://$OUT/chu.db" --records "$OUT/records" \
-  2> "$OUT/server.log" &
+  --leagues "$ROOT/leagues.toml" --http 127.0.0.1:0 2> "$OUT/server.log" &
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null || true' EXIT
 for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break; sleep 0.1; done

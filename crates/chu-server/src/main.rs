@@ -25,7 +25,7 @@ struct Args {
     db: String,
     #[arg(long, default_value = "records")]
     records: PathBuf,
-    /// Floodgate league schedule.
+    /// The league list: every game the server plays.
     #[arg(long, default_value = "leagues.toml")]
     leagues: PathBuf,
     #[arg(long, value_enum, default_value = "ffi")]
@@ -51,7 +51,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let leagues = chu_server::league::load(&args.leagues)?;
     for l in &leagues {
-        info!("league {}: every {} min (+{}), cutoff {} s, rated {}", l.name, l.every_min, l.offset_min, l.cutoff_s, l.rated);
+        let pairing = match l.schedule() {
+            Some(s) => format!("every {} min (+{}), cutoff {} s", s.every_min, s.offset_min, s.cutoff_s),
+            None => "on demand".into(),
+        };
+        info!("league {} ({:?}): {}, {}, {}, rated {}", l.name, l.kind, l.describe_time(), l.rules.as_str(), pairing, l.rated);
     }
     let server = Server::start(Config { referee, db_url: args.db, records_dir: args.records, leagues }).await?;
     let http = TcpListener::bind(&args.http).await?;

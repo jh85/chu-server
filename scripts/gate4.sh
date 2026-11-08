@@ -4,7 +4,7 @@
 #
 # A fresh server (web front end on 0.0.0.0:HTTP, so a phone on the LAN can
 # open it) and two chushogi-az bridges, softz_iter_0202 vs a0gb_iter_0202,
-# in a challenge league at 600+10F: an az-vs-az game lasts several minutes.
+# in a challenge league `demo` at 600+10F (OUT/leagues.toml): an az-vs-az game lasts several minutes.
 # scripts/check_gate4.py follows the game in a phone-sized headless Firefox
 # and does the download and replay; open http://<this host>:HTTP/ on a real
 # phone at the same time to watch along.
@@ -20,7 +20,7 @@ PORT=${PORT:-14085}
 HTTP=${HTTP:-18081}
 EVAL_PORT=${EVAL_PORT:-51620}
 THREADS=${THREADS:-12}
-LEAGUE=chu-demo-600-10F
+LEAGUE=demo
 AZ=$ROOT/vendor/chushogi/chushogi-az
 GEN=$ROOT/vendor/chushogi/chushogi-gen
 set -e
@@ -29,7 +29,16 @@ cargo build --release -q --manifest-path "$ROOT/Cargo.toml"
 set +e
 BIN=$ROOT/target/release
 mkdir -p "$OUT"
-: > "$OUT/leagues.toml"
+cat > "$OUT/leagues.toml" <<TOML
+[[league]]
+name = "$LEAGUE"
+kind = "challenge"
+total_s = 600
+byoyomi_s = 0
+increment_s = 10
+rules = "lishogi"
+rated = false
+TOML
 echo "output: $OUT"
 pids=()
 trap 'kill "${pids[@]}" 2>/dev/null' EXIT

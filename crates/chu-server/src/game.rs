@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use chu_proto::{
-    ClientMsg, GameName, GameSummary, PlayedMove, Reason, ResumedClock, Side, Verdict, AGREE_TIMEOUT_S, MAX_MOVES,
+    ClientMsg, GameSummary, PlayedMove, Reason, ResumedClock, Side, Verdict, AGREE_TIMEOUT_S, MAX_MOVES,
 };
 use chu_rules::{GameEnd, Referee};
 use serde::Serialize;
@@ -18,6 +18,7 @@ use tokio::time::{sleep_until, Instant};
 use tracing::{info, warn};
 
 use crate::clock::TimeControl;
+use crate::league::RuleSet;
 use crate::lobby::{LobbyMsg, LobbyTx};
 use crate::store::{FinishedGame, RecordedMove, StartedGame, StoreMsg, StoreTx};
 use crate::{chu_side, proto_side, Conn, Ctl};
@@ -105,7 +106,9 @@ pub struct PlayerSlot {
 
 pub struct GameSetup {
     pub id: String,
-    pub name: GameName,
+    /// The league's name and rules.
+    pub league: String,
+    pub rules: RuleSet,
     pub initial_sfen: String,
     pub tc: TimeControl,
     pub rated: bool,
@@ -126,7 +129,8 @@ fn idx(s: Side) -> usize {
 
 struct Game {
     id: String,
-    name: GameName,
+    league: String,
+    rules: RuleSet,
     initial_sfen: String,
     tc: TimeControl,
     rated: bool,
@@ -176,7 +180,8 @@ async fn run(setup: GameSetup, mut rx: mpsc::UnboundedReceiver<GameInput>) {
     let to_move = if setup.initial_sfen.split(' ').nth(1) == Some("w") { Side::Gote } else { Side::Sente };
     let mut g = Game {
         id: setup.id,
-        name: setup.name,
+        league: setup.league,
+        rules: setup.rules,
         initial_sfen: setup.initial_sfen,
         tc: setup.tc,
         rated: setup.rated,
@@ -209,7 +214,7 @@ impl Game {
             protocol_version: "1.2".into(),
             protocol_mode: "Server".into(),
             format: "Chushogi 1.0".into(),
-            rules: self.name.rules().into(),
+            rules: self.rules.as_str().into(),
             game_id: self.id.clone(),
             name_plus: self.players[0].name.clone(),
             name_minus: self.players[1].name.clone(),
@@ -553,7 +558,7 @@ impl Game {
     fn live_state(&self) -> LiveState {
         LiveState {
             id: self.id.clone(),
-            league: self.name.to_string(),
+            league: self.league.clone(),
             sente: self.players[0].name.clone(),
             gote: self.players[1].name.clone(),
             initial_sfen: self.initial_sfen.clone(),
@@ -570,8 +575,8 @@ impl Game {
     fn started_game(&self) -> StartedGame {
         StartedGame {
             id: self.id.clone(),
-            league: self.name.to_string(),
-            rules: self.name.rules().into(),
+            league: self.league.clone(),
+            rules: self.rules.as_str().into(),
             sente: self.players[0].name.clone(),
             gote: self.players[1].name.clone(),
             initial_sfen: self.initial_sfen.clone(),

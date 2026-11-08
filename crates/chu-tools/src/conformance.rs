@@ -12,7 +12,9 @@
 //!   after the client's second move.
 //!
 //! Every client move must be legal (chu-rules), in turn, with its colour and
-//! within its time by the scripted server's clock.
+//! within its time by the scripted server's clock. The scripted server takes
+//! any well-formed game name as its one league and plays it at 60 s + 1 s
+//! Fischer, lishogi rules (the client learns that from the Game_Summary).
 //! The client runs as `sh -c <cmd>` with `{server}` replaced by the scripted
 //! server's address (also in `CHU_SERVER`) and must play at least 3 games.
 
@@ -22,7 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use chu_proto::clock::TimeControl;
-use chu_proto::{ClientMsg, ColorReq, GameName, GameSummary, PlayedMove, ResumedClock, Side, TimeUnit, MAX_MOVES};
+use chu_proto::{ClientMsg, ColorReq, GameSummary, PlayedMove, ResumedClock, Side, TimeUnit, MAX_MOVES};
 use chu_rules::{Backend, GameEnd, Referee, START_SFEN};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -229,7 +231,7 @@ impl Script<'_> {
     fn queue(&mut self, c: &mut Conn, check: &str) -> Res<()> {
         let line = c.recv(LINE_WITHIN)?.ok_or("the client closed instead of queueing")?;
         let ok = match ClientMsg::parse(&line) {
-            ClientMsg::Game { game_name, color, sfen: None } if game_name.parse::<GameName>().is_ok() => {
+            ClientMsg::Game { game_name, color, sfen: None } if chu_proto::valid_name(&game_name) => {
                 if self.game_name.is_empty() {
                     self.game_name = game_name;
                     self.color = color;
@@ -274,8 +276,7 @@ impl Script<'_> {
         let names = if client == Side::Sente { [self.name.as_str(), OPPONENT] } else { [OPPONENT, self.name.as_str()] };
         let suffix = if n == 0 { String::new() } else { format!("-{}", n + 1) };
         let id = format!("{}+{}+{}+20260101000000{suffix}", self.game_name, names[0], names[1]);
-        let parsed: GameName = self.game_name.parse().map_err(|_| "bad game name")?;
-        Game::new(id, client, TimeControl::from_game_name(&parsed, TimeUnit::Msec))
+        Game::new(id, client, TimeControl::from_secs(60, 0, 1, TimeUnit::Msec))
     }
 
     /// Plays until the client has made `until` moves in total and it is the

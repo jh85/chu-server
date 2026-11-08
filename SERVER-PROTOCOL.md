@@ -1,6 +1,6 @@
 # Chu-Server Protocol 1.0 — client ↔ tournament server
 
-Status: draft 4, 2026-11-05. Derived from CSA Server Protocol 1.2.1 (shogi-server / floodgate); the session
+Status: draft 5, 2026-11-08. Derived from CSA Server Protocol 1.2.1 (shogi-server / floodgate); the session
 grammar is CSA's, the game content is USI-Chu (see `USI-CHU.md`). Reference implementation: `chu-server`;
 reference client: `chu-bridge`. "MUST / SHOULD / MAY" as in RFC 2119.
 
@@ -31,18 +31,23 @@ is mandatory. A second login with the same name closes the first connection.
 
 | Command | Reply |
 | --- | --- |
-| `%%GAME <game-name> <+\|-\|*>` | Queue for a game. `*` = either colour; `+`/`-` = sente/gote (challenge leagues only; `*` is accepted there too). |
-| `%%GAME <game-name> * <sfen>` | Only in `chu-test-*` leagues: start from a given SFEN, unrated. |
+| `%%GAME <game-name> <+\|-\|*>` | Queue for a game. `*` = either colour; `+`/`-` = sente/gote (challenge and test leagues only; `*` is accepted there too). |
+| `%%GAME <game-name> <+\|-\|*> <sfen>` | Only in test leagues: start from a given SFEN, unrated. |
 | `%%WHO`, `%%LIST`, `%%SHOW <game-id>` | Player list, game list, moves of a game, each terminated by `##[…] +OK`. |
 | `%%MONITORON <game-id>` / `%%MONITOROFF <game-id>` | Receive / stop receiving a game's moves as `##[MONITOR][<game-id>] <line>`. |
 | `%%CHAT <utf8 text>` | Broadcast `##[CHAT][<name>] <text>`. |
 
-Game-name grammar: `chu-<league>-<total-s>-<byoyomi-s>[F][-jcsa]`.
-`chu-floodgate-600-10F` = 600 s + 10 s Fischer, lishogi rules; `chu-floodgate-900-30-jcsa` = 900 s + 30 s byoyomi, JCSA rules.
-Leagues named `floodgate` pair on the server's schedule (`every_min` and `offset_min`, UTC, in `leagues.toml`);
-other leagues pair as soon as two queued players match. A round whose time passed while the server was not running
-is fired late only if the next round is not yet due; otherwise it is skipped with a warning and the gap is visible
-in the rounds audit table.
+A game name is a label from the server's league list, matching `[A-Za-z0-9_-]{1,32}`; clients MUST NOT parse it.
+The time control and rules are given only in the Game_Summary (§4). `%%GAME` with a name that is not in the list
+is rejected with `##[ERROR] unknown league <game-name>`. Each league has a kind:
+
+- floodgate: pairs on the server's schedule (a round every `every_min` minutes at `offset_min`, UTC); `*` only.
+  A round whose time passed while the server was not running is fired late only if the next round is not yet
+  due; otherwise it is skipped with a warning and the gap is visible in the rounds audit table.
+- challenge: pairs the first two queued players whose colour requests (`+`/`-`, if given) fit.
+- test: like challenge, and `%%GAME` MAY carry a start SFEN (both players must give the same one); never rated.
+
+Ratings are kept per league name.
 
 ## 4. Game start
 
@@ -52,7 +57,7 @@ in the rounds audit table.
 < Protocol_Mode:Server
 < Format:Chushogi 1.0
 < Rules:lishogi
-< Game_ID:chu-floodgate-600-10F+az_v12+random_bot+20261104213000
+< Game_ID:floodgate-600-10F+az_v12+random_bot+20261104213000
 < Name+:az_v12
 < Name-:random_bot
 < Your_Turn:+
@@ -75,7 +80,7 @@ in the rounds audit table.
 ```
 
 - `Game_ID` is `<game-name>+<sente>+<gote>+<UTC yyyymmddhhmmss>`, with `-2`, `-3`, … appended when two games start in the same second.
-- `Rules:` is `lishogi` or `jcsa` (JCSA leagues are deferred; v1 runs lishogi rules only). `Time_Unit:` is `1msec` or `1sec` per league; all time fields use it.
+- `Rules:` is `lishogi` or `jcsa`, per league. `Time_Unit:` is `1msec` or `1sec`; all time fields use it.
 - `REJECT`, or no answer within 30 s, cancels the game: both players receive `REJECT:<game-id> by <name>` and return to the lobby.
 - A resumed game adds `MOVES:<move>,T<n>` lines after `SFEN:`, one per move already played; `To_Move:` is the side to move after them.
   Its Time block also carries `Remaining+:<n>`, `Remaining-:<n>` and `Turn_Used:<n>` (all in `Time_Unit`):

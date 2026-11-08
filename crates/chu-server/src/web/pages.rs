@@ -5,7 +5,6 @@
 use std::collections::BTreeMap;
 
 use axum::http::StatusCode;
-use chu_proto::GameName;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 
 use super::chart::{self, Chart};
@@ -13,6 +12,7 @@ use super::{GameRow, HeadToHead, LeagueInfo, MoveRow, Standing};
 use crate::game::LiveState;
 use crate::lobby::LobbySnapshot;
 use crate::rating::PUBLISH_AFTER;
+use crate::league::{Kind, LeagueConfig, RuleSet};
 
 pub struct RoundLine {
     pub at: String,
@@ -67,14 +67,27 @@ fn stamp(iso: &str) -> Markup {
     }
 }
 
-/// `600 s + 10 s Fischer`, or the name itself.
-fn time_control(league: &str) -> String {
-    match league.parse::<GameName>() {
-        Ok(n) if n.fischer => format!("{} s + {} s Fischer", n.total_s, n.byoyomi_s),
-        Ok(n) if n.byoyomi_s > 0 => format!("{} s + {} s byoyomi", n.total_s, n.byoyomi_s),
-        Ok(n) => format!("{} s", n.total_s),
-        Err(_) => league.to_owned(),
+/// `600 s + 10 s Fischer`, from `leagues.toml`; a league no longer listed
+/// there has only its games left.
+fn time_control(cfg: Option<&LeagueConfig>) -> String {
+    cfg.map_or_else(|| "not in the league list".into(), LeagueConfig::describe_time)
+}
+
+/// How a league pairs: `every 30 min`, `on demand`, `test`.
+fn pairing_text(cfg: Option<&LeagueConfig>) -> String {
+    let Some(c) = cfg else { return "–".into() };
+    let mut t = match (c.kind, c.schedule()) {
+        (_, Some(s)) => format!("every {} min", s.every_min),
+        (Kind::Test, _) => "test, on demand".into(),
+        _ => "on demand".into(),
+    };
+    if !c.rated {
+        t.push_str(", unrated");
     }
+    if c.rules == RuleSet::Jcsa {
+        t.push_str(", JCSA rules");
+    }
+    t
 }
 
 /// `#ROYALS_LOST` → `royals lost`.
@@ -163,11 +176,8 @@ pub fn index(leagues: &[LeagueInfo], snap: &LobbySnapshot, recent: &[GameRow]) -
                     @for l in leagues {
                         tr {
                             td { a href=(format!("/league/{}", l.name)) { (l.name) } }
-                            td.wide { (time_control(&l.name)) }
-                            td { @match &l.config {
-                                Some(c) => { "every " (c.every_min) " min" @if !c.rated { ", unrated" } }
-                                None => { "on demand" }
-                            } }
+                            td.wide { (time_control(l.config.as_ref())) }
+                            td { (pairing_text(l.config.as_ref())) }
                             td.time { @if let Some(t) = l.next_round() { (stamp(&t)) } @else { "–" } }
                             td.num.wide { (l.games) }
                         }
@@ -242,7 +252,7 @@ fn chart_table(c: &Chart) -> Markup {
 #[allow(clippy::too_many_arguments)]
 pub fn league(
     name: &str,
-    cfg: Option<&crate::league::LeagueConfig>,
+    cfg: Option<&LeagueConfig>,
     table: &[Standing],
     chart: &Chart,
     recent: &[GameRow],
@@ -253,10 +263,12 @@ pub fn league(
     layout(name, html! {
         h1 { (name) }
         p.meta {
-            (time_control(name))
-            @if let Some(c) = cfg {
-                " · a round every " (c.every_min) " min, cutoff " (c.cutoff_s) " s · next "
-                (when(&crate::util::Utc::from(c.next_round(std::time::SystemTime::now())).iso()))
+            (time_control(cfg))
+            @if let Some(s) = cfg.and_then(LeagueConfig::schedule) {
+                " · a round every " (s.every_min) " min, cutoff " (s.cutoff_s) " s · next "
+                (when(&crate::util::Utc::from(s.next_round(std::time::SystemTime::now())).iso()))
+            } @else if cfg.is_some() {
+                " · " (pairing_text(cfg))
             }
             " · " a href=(format!("/api/games?league={name}")) { "JSON" }
         }
@@ -332,13 +344,13 @@ fn board_block(sente: &str, gote: &str, moves: &[(String, String)]) -> Markup {
     }
 }
 
-pub fn live_game(st: &LiveState) -> Markup {
+pub fn live_game(st: &LiveState, cfg: Option<&LeagueConfig>) -> Markup {
     let data = serde_json::json!({ "live": true, "events": format!("/game/{}/events", st.id), "state": st });
     let moves: Vec<(String, String)> = st.moves.iter().map(|m| (m.side.to_owned(), m.usi.clone())).collect();
     layout(&format!("{} vs {}", st.sente, st.gote), html! {
         h1 { (st.sente) " vs " (st.gote) }
         p.meta {
-            a href=(format!("/league/{}", st.league)) { (st.league) } " · " (time_control(&st.league)) " · "
+            a href=(format!("/league/{}", st.league)) { (st.league) } " · " (time_control(cfg)) " · "
             span #status.live { @if st.started { "live" } @else { "starting" } }
         }
         (board_block(&st.sente, &st.gote, &moves))
@@ -347,7 +359,7 @@ pub fn live_game(st: &LiveState) -> Markup {
     })
 }
 
-pub fn finished_game(g: &GameRow, initial_sfen: &str, moves: &[MoveRow]) -> Markup {
+pub fn finished_game(g: &GameRow, cfg: Option<&LeagueConfig>, initial_sfen: &str, moves: &[MoveRow]) -> Markup {
     let used = |side: &str| moves.iter().filter(|m| m.side == side).map(|m| m.elapsed_ms).sum::<i64>();
     let data = serde_json::json!({
         "live": false,
@@ -360,7 +372,7 @@ pub fn finished_game(g: &GameRow, initial_sfen: &str, moves: &[MoveRow]) -> Mark
     layout(&format!("{} vs {}", g.sente, g.gote), html! {
         h1 { (g.sente) " vs " (g.gote) }
         p.meta {
-            a href=(format!("/league/{}", g.league)) { (g.league) } " · " (time_control(&g.league)) " · "
+            a href=(format!("/league/{}", g.league)) { (g.league) } " · " (time_control(cfg)) " · "
             span #status {
                 @if let Some(e) = &g.ended_at {
                     (score(g.result.as_deref())) " " (g.reason.as_deref().map(reason_text).unwrap_or_default())

@@ -28,7 +28,6 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use chu_proto::GameName;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -120,14 +119,16 @@ pub struct GameRow {
     pub reason: Option<String>,
     pub ply_count: i64,
     pub rated: bool,
+    pub rules: String,
 }
 
-type GameTuple = (String, String, String, String, String, Option<String>, Option<String>, Option<String>, i64, i64);
+type GameTuple =
+    (String, String, String, String, String, Option<String>, Option<String>, Option<String>, i64, i64, String);
 
 impl From<GameTuple> for GameRow {
     fn from(t: GameTuple) -> GameRow {
-        let (id, league, sente, gote, started_at, ended_at, result, reason, ply_count, rated) = t;
-        GameRow { id, league, sente, gote, started_at, ended_at, result, reason, ply_count, rated: rated != 0 }
+        let (id, league, sente, gote, started_at, ended_at, result, reason, ply_count, rated, rules) = t;
+        GameRow { id, league, sente, gote, started_at, ended_at, result, reason, ply_count, rated: rated != 0, rules }
     }
 }
 
@@ -144,7 +145,7 @@ fn record_rel(league: &str, started_at: &str, id: &str) -> String {
     format!("{league}/{}/{}/{}/{id}", d(0..4), d(5..7), d(8..10))
 }
 
-const GAME_COLS: &str = "id, league, sente, gote, started_at, ended_at, result, reason, ply_count, rated";
+const GAME_COLS: &str = "id, league, sente, gote, started_at, ended_at, result, reason, ply_count, rated, rules";
 
 fn rows(v: Vec<GameTuple>) -> Vec<GameRow> {
     v.into_iter().map(GameRow::from).collect()
@@ -244,7 +245,8 @@ pub struct LeagueInfo {
 
 impl LeagueInfo {
     pub fn next_round(&self) -> Option<String> {
-        self.config.as_ref().map(|c| Utc::from(c.next_round(SystemTime::now())).iso())
+        let s = self.config.as_ref()?.schedule()?;
+        Some(Utc::from(s.next_round(SystemTime::now())).iso())
     }
 }
 
@@ -291,8 +293,14 @@ async fn live_fragment(State(ctx): Shared) -> Response {
     pages::live(&snapshot(&ctx.lobby).await).into_response()
 }
 
+impl Ctx {
+    fn league(&self, name: &str) -> Option<&LeagueConfig> {
+        self.leagues.iter().find(|l| l.name == name)
+    }
+}
+
 fn check_league(ctx: &Ctx, name: &str, known: bool) -> WebResult<Option<LeagueConfig>> {
-    let cfg = ctx.leagues.iter().find(|l| l.name == name).cloned();
+    let cfg = ctx.league(name).cloned();
     if cfg.is_none() && !known {
         return Err(not_found(&format!("No league {name}.")));
     }
@@ -354,7 +362,7 @@ pub struct MoveRow {
 
 async fn game(State(ctx): Shared, Path(id): Path<String>) -> WebResult<Response> {
     if let Some((state, _)) = watch(&ctx.lobby, &id).await {
-        return Ok(pages::live_game(&state).into_response());
+        return Ok(pages::live_game(&state, ctx.league(&state.league)).into_response());
     }
     let q = format!("SELECT {GAME_COLS} FROM games WHERE id = ?");
     let row: Option<GameTuple> = sqlx::query_as(&q).bind(&id).fetch_optional(&ctx.db).await?;
@@ -375,7 +383,7 @@ async fn game(State(ctx): Shared, Path(id): Path<String>) -> WebResult<Response>
             MoveRow { side: if sente { "b" } else { "w" }, usi, elapsed_ms, sfen }
         })
         .collect();
-    Ok(pages::finished_game(&row, &initial_sfen, &moves).into_response())
+    Ok(pages::finished_game(&row, ctx.league(&row.league), &initial_sfen, &moves).into_response())
 }
 
 async fn watch(lobby: &LobbyTx, id: &str) -> Option<(crate::game::LiveState, tokio::sync::broadcast::Receiver<LiveEvent>)> {
@@ -514,7 +522,7 @@ async fn api_games(State(ctx): Shared, Query(q): Query<GamesQuery>) -> WebResult
             serde_json::json!({
                 "id": g.id,
                 "league": g.league,
-                "rules": GameName::from_str(&g.league).map(|n| n.rules()).unwrap_or("lishogi"),
+                "rules": g.rules,
                 "sente": g.sente,
                 "gote": g.gote,
                 "started_at": g.started_at,

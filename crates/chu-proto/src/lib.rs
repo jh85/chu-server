@@ -1,14 +1,12 @@
 //! Chu-Server Protocol 1.0 (SERVER-PROTOCOL.md): line tokenizer, client and
-//! server messages, game names, and the Game_Summary block. Shared by the
+//! server messages and the Game_Summary block. Shared by the
 //! server and the bridge; no I/O here.
 
 mod bucket;
 pub mod clock;
-mod game_name;
 mod summary;
 
 pub use bucket::LineBucket;
-pub use game_name::GameName;
 pub use summary::{GameSummary, PlayedMove, ResumedClock, SummaryError, TimeConfig, TimeUnit};
 
 use std::fmt;
@@ -76,7 +74,7 @@ pub fn tokens(line: &str) -> impl Iterator<Item = &str> {
     line.split(' ').filter(|t| !t.is_empty())
 }
 
-/// `[A-Za-z0-9_-]{1,32}` (§2).
+/// `[A-Za-z0-9_-]{1,32}`: login names (§2) and league names (§3).
 pub fn valid_name(name: &str) -> bool {
     (1..=32).contains(&name.len())
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')

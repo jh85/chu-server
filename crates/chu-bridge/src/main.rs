@@ -41,7 +41,7 @@ struct Cli {
     name: Option<String>,
     #[arg(long, required_unless_present = "conformance")]
     password: Option<String>,
-    /// Game name, e.g. chu-floodgate-600-10F.
+    /// Game name: a league from the server's list, e.g. floodgate-600-10F.
     #[arg(long, required_unless_present = "conformance")]
     game: Option<String>,
     /// `+`, `-` or `*`.

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Phase-2 gate (DESIGN.md): chushogi-az with CKPT against `chushogi-gen` (a
 # random player), GAMES games at 600+10F, both engines behind chu-bridge.
-# Pairs of bridges run in parallel, each pair in its own challenge league so
-# az never meets az; az has sente in the first half of the pairs and gote in
+# Pairs of bridges run in parallel, each pair in its own challenge league
+# (written to OUT/leagues.toml) so az never meets az; az has sente in the first half of the pairs and gote in
 # the second. Then scripts/check_gate2.py: no az loss on #TIME_UP,
 # #ILLEGAL_MOVE or #ILLEGAL_ACTION, every az move in the records is the
 # engine's bestmove from the bridge log, and every record replays.
@@ -20,7 +20,6 @@ PYTHON=${PYTHON:-python3}
 PORT=${PORT:-14083}
 EVAL_PORT=${EVAL_PORT:-51600}
 SIMS=${SIMS:-1024}
-TC=600-10F
 AZ=$ROOT/vendor/chushogi/chushogi-az
 (( GAMES % PAIRS == 0 )) || { echo "GAMES must be a multiple of PAIRS" >&2; exit 2; }
 
@@ -29,6 +28,9 @@ BIN=$ROOT/target/release
 GEN=$(ls -t "$BIN"/build/chu-rules-*/out/chushogi-gen | head -1)
 mkdir -p "$OUT"
 echo "output: $OUT"
+for p in $(seq "$PAIRS"); do
+  printf '[[league]]\nname = "gate2_%s"\nkind = "challenge"\ntotal_s = 600\nbyoyomi_s = 0\nincrement_s = 10\nrules = "lishogi"\nrated = false\n\n' "$p"
+done > "$OUT/leagues.toml"
 pids=()
 trap 'kill "${pids[@]}" 2>/dev/null || true' EXIT
 
@@ -43,13 +45,13 @@ grep -q "serving on" "$OUT/eval_server.log" || { cat "$OUT/eval_server.log"; exi
 "$PYTHON" "$ROOT/scripts/az_time_model.py" --az "$AZ" --gen "$GEN" --port "$EVAL_PORT" "$OUT/time_model.txt" 2> /dev/null
 
 "$BIN/chu-server" --listen "127.0.0.1:$PORT" --db "sqlite://$OUT/chu.db" --records "$OUT/records" \
-  2> "$OUT/server.log" &
+  --leagues "$OUT/leagues.toml" --http 127.0.0.1:0 2> "$OUT/server.log" &
 pids+=($!)
 for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break; sleep 0.1; done
 
 bridges=()
 for p in $(seq "$PAIRS"); do
-  game=chu-gate2_$p-$TC
+  game=gate2_$p
   if (( p <= PAIRS / 2 )); then az_color=+; gen_color=-; else az_color=-; gen_color=+; fi
   common=(--server "127.0.0.1:$PORT" --password gate --game "$game" --games $((GAMES / PAIRS)) --log-format json)
   "$BIN/chu-bridge" "${common[@]}" --name "az_$p" --color "$az_color" \
