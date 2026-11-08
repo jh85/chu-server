@@ -332,7 +332,7 @@ fn board_block(sente: &str, gote: &str, moves: &[(String, String)]) -> Markup {
                 span #ply.muted {}
                 button type="button" data-step="fwd" title="forward" { "▶" }
                 button type="button" data-step="last" title="latest position" { "⏭" }
-                button type="button" #pieces title="letters or kanji" { "字/A" }
+                button type="button" #pieces title="letters or kanji" { "漢/A" }
             }
         }
         h2 { "Moves" }
