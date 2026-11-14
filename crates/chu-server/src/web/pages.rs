@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 
 use super::chart::{self, Chart};
-use super::{GameRow, HeadToHead, LeagueInfo, MoveRow, Standing};
+use super::{GameRow, HeadToHead, LeagueInfo, LiveRow, MoveRow, Standing};
 use crate::game::LiveState;
 use crate::lobby::LobbySnapshot;
 use crate::rating::PUBLISH_AFTER;
@@ -145,16 +145,58 @@ fn results_table(games: &[GameRow], show_league: bool) -> Markup {
     }
 }
 
-pub fn live(snap: &LobbySnapshot) -> Markup {
+/// Games in progress, and when the next round starts (time, league).
+fn live_games(rows: &[LiveRow], show_league: bool, next: Option<&(String, String)>) -> Markup {
     html! {
-        section #live hx-get="/live" hx-trigger="every 10s" hx-swap="outerHTML" {
-            h2 { "Games in progress" }
-            @if snap.games.is_empty() { p.muted { "None right now." } }
-            ul.plain {
-                @for (id, name, sente, gote) in &snap.games {
-                    li { (game_link(id, &format!("{sente} vs {gote}"))) " " span.muted { (name) } }
+        h2 { "Games in progress" }
+        @if rows.is_empty() {
+            p.muted { "None right now." }
+        } @else {
+            div.scroll {
+                table.live {
+                    thead { tr {
+                        th { "Started" } @if show_league { th.wide { "League" } }
+                        th { "Sente" } th { "Gote" } th.num { "Plies" } th.wide { "To move" } th {}
+                    } }
+                    tbody {
+                        @for g in rows {
+                            tr {
+                                td.time { @if !g.started_at.is_empty() { (stamp(&g.started_at)) } }
+                                @if show_league { td.wide { a href=(format!("/league/{}", g.league)) { (g.league) } } }
+                                td { (player_link(&g.sente)) }
+                                td { (player_link(&g.gote)) }
+                                td.num { (g.plies) }
+                                td.wide { @if g.sente_to_move { "☗ " (g.sente) } @else { "☖ " (g.gote) } }
+                                td { (game_link(&g.id, "watch")) }
+                            }
+                        }
+                    }
                 }
             }
+        }
+        @if let Some((at, league)) = next {
+            p.muted.small {
+                "Next round: " (when(at))
+                @if show_league { " (" a href=(format!("/league/{league}")) { (league) } ")" }
+            }
+        }
+    }
+}
+
+/// The league page's games in progress; HTMX refreshes it.
+pub fn league_live(league: &str, rows: &[LiveRow], next: Option<&(String, String)>) -> Markup {
+    html! {
+        section #live hx-get=(format!("/league/{league}/live")) hx-trigger="every 10s" hx-swap="outerHTML" {
+            (live_games(rows, false, next))
+        }
+    }
+}
+
+/// The index's games in progress and players online; HTMX refreshes it.
+pub fn live(snap: &LobbySnapshot, rows: &[LiveRow], next: Option<&(String, String)>) -> Markup {
+    html! {
+        section #live hx-get="/live" hx-trigger="every 10s" hx-swap="outerHTML" {
+            (live_games(rows, true, next))
             h2 { "Online" }
             @if snap.players.is_empty() { p.muted { "Nobody." } }
             ul.plain {
@@ -166,7 +208,13 @@ pub fn live(snap: &LobbySnapshot) -> Markup {
     }
 }
 
-pub fn index(leagues: &[LeagueInfo], snap: &LobbySnapshot, recent: &[GameRow]) -> Markup {
+pub fn index(
+    leagues: &[LeagueInfo],
+    snap: &LobbySnapshot,
+    live_rows: &[LiveRow],
+    next: Option<&(String, String)>,
+    recent: &[GameRow],
+) -> Markup {
     layout("Leagues", html! {
         h1 { "Leagues" }
         div.scroll {
@@ -185,7 +233,7 @@ pub fn index(leagues: &[LeagueInfo], snap: &LobbySnapshot, recent: &[GameRow]) -
                 }
             }
         }
-        (live(snap))
+        (live(snap, live_rows, next))
         h2 { "Latest results" }
         (results_table(recent, true))
     })
@@ -258,27 +306,21 @@ pub fn league(
     recent: &[GameRow],
     rounds: &[RoundLine],
     n_rounds: i64,
-    live: &[(String, String, String, String)],
+    live: &[LiveRow],
+    next: Option<&(String, String)>,
 ) -> Markup {
     layout(name, html! {
         h1 { (name) }
         p.meta {
             (time_control(cfg))
             @if let Some(s) = cfg.and_then(LeagueConfig::schedule) {
-                " · a round every " (s.every_min) " min, cutoff " (s.cutoff_s) " s · next "
-                (when(&crate::util::Utc::from(s.next_round(std::time::SystemTime::now())).iso()))
+                " · a round every " (s.every_min) " min, cutoff " (s.cutoff_s) " s"
             } @else if cfg.is_some() {
                 " · " (pairing_text(cfg))
             }
             " · " a href=(format!("/api/games?league={name}")) { "JSON" }
         }
-        @if !live.is_empty() {
-            p { "Live: "
-                @for (i, (id, _, sente, gote)) in live.iter().enumerate() {
-                    @if i > 0 { ", " } (game_link(id, &format!("{sente} vs {gote}")))
-                }
-            }
-        }
+        (league_live(name, live, next))
         h2 { "Standings" }
         (standings(name, table))
         h2 { "Rating curves" }

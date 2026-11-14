@@ -552,6 +552,20 @@ async fn web_pages_records_api_and_live_stream() {
     assert!(mv["sfen"].as_str().unwrap().contains(" w "), "{mv}");
     // 600 s + 10 s Fischer: sente gained the increment, gote untouched.
     assert!(mv["remaining_ms"][0].as_u64().unwrap() > 600_000 && mv["remaining_ms"][1] == 600_000, "{mv}");
+
+    // Games in progress, on the index (with the league) and the league page
+    // and their HTMX fragments: one ply played, gote to move.
+    store::sync(&ts.server.store).await;
+    let row = format!(r#"<td class="num">1</td><td class="wide">☖ bob</td><td><a href="/game/{id}">watch</a>"#);
+    for path in ["/", "/live", "/league/rapid", "/league/rapid/live"] {
+        let (status, _, body) = http_get(&ts, path).await;
+        assert_eq!(status, 200, "{path}");
+        assert!(body.contains("Games in progress") && body.contains(&row), "{path}: {body}");
+        let league_cell = r#"<td class="wide"><a href="/league/rapid">rapid</a></td>"#;
+        assert_eq!(body.contains(league_cell), !path.starts_with("/league"), "{path}: {body}");
+    }
+    let (_, _, other) = http_get(&ts, "/league/blitz/live").await;
+    assert!(other.contains("None right now.") && !other.contains(&id), "{other}");
     b.send("%TORYO").await;
     let (ev, end) = sse.next().await;
     assert_eq!(ev, "end");
@@ -593,6 +607,8 @@ async fn web_pages_records_api_and_live_stream() {
         ("/", "rapid"),
         ("/league/rapid", "alice"),
         ("/league/rapid/standings", "hx-get"),
+        ("/league/rapid/live", "None right now."),
+        ("/league/floodgate-60-1F/live", "Next round: "),
         ("/league/floodgate-60-1F", "a round every 1440 min"),
         ("/league/blitz", "30 s + 10 s byoyomi · on demand, JCSA rules"),
         ("/player/alice", "bob"),

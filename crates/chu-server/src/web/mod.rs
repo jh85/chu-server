@@ -2,9 +2,11 @@
 //! server-rendered pages over the database and the lobby, an SSE stream per
 //! live game, the record tree and a JSON API.
 //!
-//! - `/` leagues, next rounds, players online, games in progress
-//! - `/league/{name}` standings (refreshed by HTMX), latest results, rounds,
-//!   rating curves (`/league/{name}/rating.svg` on its own)
+//! - `/` leagues, next rounds, games in progress (refreshed by HTMX, as
+//!   `/live`), players online
+//! - `/league/{name}` games in progress (`/league/{name}/live`) and standings
+//!   (both refreshed by HTMX), latest results, rounds, rating curves
+//!   (`/league/{name}/rating.svg` on its own)
 //! - `/game/{id}` board and moves; live games stream `/game/{id}/events`
 //! - `/player/{name}` ratings, head-to-head, history with record downloads
 //! - `/records/…` the record tree; `/api/games?league=&since=&limit=` JSON
@@ -68,6 +70,7 @@ pub fn router(ctx: Arc<Ctx>) -> Router {
         .route("/", get(index))
         .route("/live", get(live_fragment))
         .route("/league/{name}", get(league))
+        .route("/league/{name}/live", get(league_live_fragment))
         .route("/league/{name}/standings", get(standings_fragment))
         .route("/league/{name}/rating.svg", get(rating_svg))
         .route("/game/{id}", get(game))
@@ -272,6 +275,60 @@ async fn leagues(ctx: &Ctx) -> Result<Vec<LeagueInfo>, sqlx::Error> {
     Ok(out)
 }
 
+/// A game in progress as the pages list it.
+#[derive(Debug, Clone)]
+pub struct LiveRow {
+    pub id: String,
+    pub league: String,
+    pub sente: String,
+    pub gote: String,
+    /// Empty if the game is not in the database yet (it is written at START).
+    pub started_at: String,
+    pub plies: i64,
+    pub sente_to_move: bool,
+}
+
+/// The lobby's games (of `league`, or all), with the start time and the
+/// moves so far from the database.
+async fn live_rows(db: &SqlitePool, snap: &LobbySnapshot, league: Option<&str>) -> Result<Vec<LiveRow>, sqlx::Error> {
+    let mut out = Vec::new();
+    for (id, name, sente, gote) in &snap.games {
+        if league.is_some_and(|l| l != name) {
+            continue;
+        }
+        let row: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT started_at, initial_sfen, (SELECT COUNT(*) FROM moves WHERE game_id = games.id) FROM games WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(db)
+        .await?;
+        let (started_at, sfen, plies) = row.unwrap_or_default();
+        let sente_first = sfen.split(' ').nth(1) != Some("w");
+        out.push(LiveRow {
+            id: id.clone(),
+            league: name.clone(),
+            sente: sente.clone(),
+            gote: gote.clone(),
+            started_at,
+            plies,
+            sente_to_move: sente_first == (plies % 2 == 0),
+        });
+    }
+    Ok(out)
+}
+
+/// The next scheduled round of `league`, or the earliest of all leagues:
+/// its time and league.
+fn next_round(ctx: &Ctx, league: Option<&str>) -> Option<(String, String)> {
+    let now = SystemTime::now();
+    ctx.leagues
+        .iter()
+        .filter(|l| league.is_none_or(|n| n == l.name))
+        .filter_map(|l| l.schedule().map(|s| (s.next_round(now), l.name.clone())))
+        .min()
+        .map(|(t, name)| (Utc::from(t).iso(), name))
+}
+
 async fn snapshot(lobby: &LobbyTx) -> LobbySnapshot {
     let (reply, rx) = oneshot::channel();
     if lobby.send(LobbyMsg::Snapshot { reply }).is_err() {
@@ -285,12 +342,21 @@ async fn snapshot(lobby: &LobbyTx) -> LobbySnapshot {
 async fn index(State(ctx): Shared) -> WebResult<Response> {
     let leagues = leagues(&ctx).await?;
     let snap = snapshot(&ctx.lobby).await;
+    let live = live_rows(&ctx.db, &snap, None).await?;
     let recent = recent_games(&ctx.db, None, 15).await?;
-    Ok(pages::index(&leagues, &snap, &recent).into_response())
+    Ok(pages::index(&leagues, &snap, &live, next_round(&ctx, None).as_ref(), &recent).into_response())
 }
 
-async fn live_fragment(State(ctx): Shared) -> Response {
-    pages::live(&snapshot(&ctx.lobby).await).into_response()
+async fn live_fragment(State(ctx): Shared) -> WebResult<Response> {
+    let snap = snapshot(&ctx.lobby).await;
+    let live = live_rows(&ctx.db, &snap, None).await?;
+    Ok(pages::live(&snap, &live, next_round(&ctx, None).as_ref()).into_response())
+}
+
+async fn league_live_fragment(State(ctx): Shared, Path(name): Path<String>) -> WebResult<Response> {
+    check_league(&ctx, &name, league_known(&ctx.db, &name).await?)?;
+    let live = live_rows(&ctx.db, &snapshot(&ctx.lobby).await, Some(&name)).await?;
+    Ok(pages::league_live(&name, &live, next_round(&ctx, Some(&name)).as_ref()).into_response())
 }
 
 impl Ctx {
@@ -334,9 +400,10 @@ async fn league(State(ctx): Shared, Path(name): Path<String>) -> WebResult<Respo
             sat_out,
         })
         .collect();
-    let snap = snapshot(&ctx.lobby).await;
-    let live: Vec<_> = snap.games.into_iter().filter(|g| g.1 == name).collect();
-    Ok(pages::league(&name, cfg.as_ref(), &table, &chart, &recent, &rounds, n_rounds, &live).into_response())
+    let live = live_rows(&ctx.db, &snapshot(&ctx.lobby).await, Some(&name)).await?;
+    let next = next_round(&ctx, Some(&name));
+    Ok(pages::league(&name, cfg.as_ref(), &table, &chart, &recent, &rounds, n_rounds, &live, next.as_ref())
+        .into_response())
 }
 
 async fn standings_fragment(State(ctx): Shared, Path(name): Path<String>) -> WebResult<Response> {
