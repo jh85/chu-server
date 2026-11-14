@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Bots on a running chu-server: random, random_mate1 (chushogi-gen with
 # MateNodes=1) and one chushogi-az bot per checkpoint, each with its own eval
-# server. They queue in LEAGUE and play until stopped (Ctrl-C stops all).
+# server. They queue in LEAGUE and play until stopped (Ctrl-C stops all); a
+# bridge that exits is started again after 30 s.
 #
 # Usage: scripts/bots.sh [SERVER] [[NAME=]CHECKPOINT ...]
 #   SERVER      host:port of the chu-server; also from $SERVER (127.0.0.1:4081)
@@ -63,9 +64,21 @@ for i in "${!names[@]}"; do
 done
 
 common=(--server "$SERVER" --password "$PASSWORD" --game "$LEAGUE" --games 1000000 --log-format json)
+# Runs "$@" again 30 s after it exits, until this subshell is stopped.
+supervise() {
+  local child
+  trap 'kill $child 2>/dev/null; exit 0' INT TERM
+  while :; do
+    "$@" & child=$!
+    wait $child
+    echo "{\"message\":\"bots.sh: chu-bridge exited ($?); restarting in 30 s\"}" >&2
+    sleep 30 & child=$!
+    wait $child
+  done
+}
 bridge() {
   local name=$1; shift
-  "$BIN/chu-bridge" "${common[@]}" --name "$name" "$@" 2> "$OUT/bridge_$name.log" &
+  supervise "$BIN/chu-bridge" "${common[@]}" --name "$name" "$@" 2>> "$OUT/bridge_$name.log" &
   pids+=($!)
 }
 bridge random --engine "$GEN" --usi-option Seed=1

@@ -10,11 +10,11 @@
 use std::time::Duration;
 
 use chu_proto::clock::TimeControl;
-use chu_proto::{ColorReq, GameSummary, LineBucket, ServerMsg, Side, Verdict};
+use chu_proto::{ColorReq, GameSummary, LineBucket, ServerMsg, Side, Verdict, AGREE_TIMEOUT_S};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::time::{sleep, sleep_until, timeout, Instant};
+use tokio::time::{sleep, sleep_until, timeout, timeout_at, Instant};
 use tracing::{debug, info, warn};
 
 use crate::engine::{parse_bestmove, Engine};
@@ -34,6 +34,13 @@ pub struct Config {
 const STOP_LEAD: Duration = Duration::from_millis(200);
 /// Longest wait for a `bestmove` after `stop`.
 const STOP_ANSWER: Duration = Duration::from_secs(10);
+/// How long past a deadline the server has to say something (the side to
+/// move's time limit in a game, the AGREE limit before one) before the
+/// connection counts as dead. A connection that only receives never notices
+/// a peer gone from the network.
+const LIVENESS_SLACK: Duration = Duration::from_secs(10);
+/// Longest wait between reconnection attempts.
+const RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// Why a game was left.
 enum Stop {
@@ -82,8 +89,10 @@ impl Server {
     }
 }
 
-/// Connects and logs in, retrying with backoff for up to `budget`.
-async fn connect(cfg: &Config, budget: Duration) -> Res<Server> {
+/// Connects and logs in. Retries at most 5 s apart for `fast`, then up to
+/// RETRY_MAX apart; gives up after `fast` only if `give_up`. A rejected
+/// password is never retried.
+async fn connect(cfg: &Config, fast: Duration, give_up: bool) -> Res<Server> {
     let start = Instant::now();
     let mut backoff = Duration::from_millis(250);
     for attempt in 1.. {
@@ -101,17 +110,18 @@ async fn connect(cfg: &Config, budget: Duration) -> Res<Server> {
                             return Ok(s);
                         }
                         Ok(ServerMsg::LoginIncorrect) => return Err("LOGIN:incorrect".into()),
-                        _ => {}
+                        _ => warn!(server = %cfg.server, attempt, "no login reply"),
                     }
                 }
             }
             Err(e) => warn!(server = %cfg.server, attempt, error = %e, "cannot connect"),
         }
-        if start.elapsed() + backoff > budget {
+        let slow = start.elapsed() + backoff > fast;
+        if slow && give_up {
             return Err(format!("cannot reach {} after {attempt} attempts", cfg.server).into());
         }
         sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(5));
+        backoff = (backoff * 2).min(if slow { RETRY_MAX } else { Duration::from_secs(5) });
     }
     unreachable!()
 }
@@ -119,8 +129,13 @@ async fn connect(cfg: &Config, budget: Duration) -> Res<Server> {
 /// AGREE, then START (true) or REJECT (false).
 async fn agree(srv: &mut Server) -> Step<bool> {
     srv.send("AGREE").await?;
+    let deadline = Instant::now() + Duration::from_secs(AGREE_TIMEOUT_S) + LIVENESS_SLACK;
     loop {
-        match ServerMsg::parse(&srv.recv().await?) {
+        let line = timeout_at(deadline, srv.recv()).await.map_err(|_| {
+            warn!("no START or REJECT from the server");
+            Stop::Disconnected
+        })??;
+        match ServerMsg::parse(&line) {
             ServerMsg::Start(_) => return Ok(true),
             ServerMsg::Reject { game_id, by } => {
                 info!(game = %game_id, by = %by, "game cancelled");
@@ -157,18 +172,24 @@ fn idx(s: Side) -> usize {
     }
 }
 
-/// Keep-alive interval while queued; well under the 600 s idle limit.
+/// Keep-alive interval, queued or in a game; well under the 600 s idle limit.
 const KEEP_ALIVE: Duration = Duration::from_secs(60);
 
 pub async fn run(cfg: Config, mut engine: Engine) -> Res<()> {
     let mut bridge = Bridge { cfg: &cfg, engine: &mut engine, go_seq: 0, played: 0, track: None };
     let mut server: Option<Server> = None;
+    // Only the first login gives up (a wrong address shows at once); after
+    // that the bridge waits for the server however long it is away. A game
+    // cut off is resumed if the server is back within its budget.
+    let mut first = true;
     while bridge.played < cfg.games {
         let srv = match server.as_mut() {
             Some(s) => s,
             None => {
-                let budget = bridge.track.as_ref().map_or(Duration::from_secs(60), |t| t.budget);
-                server.insert(connect(&cfg, budget).await?)
+                let fast = bridge.track.as_ref().map_or(Duration::from_secs(60), |t| t.budget);
+                let s = connect(&cfg, fast, first).await?;
+                first = false;
+                server.insert(s)
             }
         };
         match bridge.one_game(srv).await {
@@ -304,16 +325,27 @@ impl Bridge<'_> {
 
         let mut pending: Option<Pending> = None;
         let mut sent: Option<String> = None;
+        let mut keep_alive_at = Instant::now() + KEEP_ALIVE;
         loop {
             if to_move == me && pending.is_none() && sent.is_none() {
                 pending = Some(self.go(&summary.sfen, &moves, me, &tc, rem, turn_start).await?);
             }
             let watchdog = pending.as_ref().filter(|p| !p.stopped).map(|p| p.deadline);
+            // By the side to move's time limit the server sends a move or a
+            // result; silence past it means the connection is dead.
+            let live_until = turn_start + Duration::from_millis(tc.allowance_ms(rem[idx(to_move)])) + LIVENESS_SLACK;
             tokio::select! {
-                line = srv.recv() => {
+                line = timeout_at(live_until, srv.recv()) => {
                     let line = match line {
-                        Ok(l) => l,
-                        Err(stop) => {
+                        Ok(Ok(l)) => {
+                            keep_alive_at = Instant::now() + KEEP_ALIVE;
+                            l
+                        }
+                        r => {
+                            if r.is_err() {
+                                warn!(game = %id, "no word from the server past the time limit");
+                            }
+                            let stop = Stop::Disconnected;
                             self.abandon(&mut pending).await?;
                             let now = Instant::now();
                             let mine = rem[idx(me)] + tc.byoyomi_ms;
@@ -389,6 +421,11 @@ impl Bridge<'_> {
                         None if line.starts_with("info string") => info!(game = %id, engine = %line, "engine says"),
                         None => debug!(target: "usi", "{line}"),
                     }
+                }
+                _ = sleep_until(keep_alive_at) => {
+                    // A failed write shows up as a failed read right after.
+                    let _ = srv.send("").await;
+                    keep_alive_at = Instant::now() + KEEP_ALIVE;
                 }
                 _ = sleep_until(watchdog.unwrap_or_else(Instant::now)), if watchdog.is_some() => {
                     let p = pending.as_mut().unwrap();

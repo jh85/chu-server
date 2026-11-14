@@ -163,3 +163,99 @@ async fn a_hung_engine_is_stopped_before_the_server_limit() {
     assert!(ls.contains(r##""reason":"#RESIGN","verdict":"#LOSE""##), "{ls}");
     assert!(lr.contains(r##""reason":"#RESIGN","verdict":"#WIN""##), "{lr}");
 }
+
+/// Forwards to `upstream` until the first connection has passed `cut_after`
+/// lines from the server; then, for `outage`, every open connection goes
+/// silent (lines are dropped, sockets stay open, as when the network goes
+/// away) and new connections are closed at once. After it, connections made
+/// since are forwarded normally.
+async fn start_outage_proxy(upstream: std::net::SocketAddr, cut_after: usize, outage: std::time::Duration) -> std::net::SocketAddr {
+    use std::sync::Mutex;
+    use tokio::time::Instant;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let down: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None)); // outage start
+    let in_outage = {
+        let down = down.clone();
+        move || down.lock().unwrap().is_some_and(|t| t.elapsed() < outage)
+    };
+    let mut first = true;
+    tokio::spawn(async move {
+        loop {
+            let (client, _) = listener.accept().await.unwrap();
+            if in_outage() {
+                continue; // dropped: closed at once
+            }
+            let server = TcpStream::connect(upstream).await.unwrap();
+            let born = Instant::now();
+            // Silent for good if this connection was open when the outage began.
+            let dead = {
+                let down = down.clone();
+                move || down.lock().unwrap().is_some_and(|t| t >= born)
+            };
+            let counts = std::mem::take(&mut first);
+            let down2 = down.clone();
+            let (crd, mut cwr) = client.into_split();
+            let (srd, mut swr) = server.into_split();
+            let dead2 = dead.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(crd).lines();
+                while let Ok(Some(l)) = lines.next_line().await {
+                    if !dead2() && swr.write_all(format!("{l}\n").as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(srd).lines();
+                let mut n = 0;
+                while let Ok(Some(l)) = lines.next_line().await {
+                    if dead() {
+                        continue;
+                    }
+                    if cwr.write_all(format!("{l}\n").as_bytes()).await.is_err() {
+                        break;
+                    }
+                    n += 1;
+                    if counts && n == cut_after {
+                        *down2.lock().unwrap() = Some(Instant::now());
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bridges_outlast_a_network_outage() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("bridge-outage");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let addr = start_server(&dir).await;
+    // Mid-game in the first game (2 s + 1 s byoyomi): the server ends it on
+    // time while both bridges hear nothing. The outage outlasts the bridges'
+    // window for resuming it (10 s after they notice), so they must keep
+    // retrying, come back, and play their second game.
+    let proxy = start_outage_proxy(addr, 30, std::time::Duration::from_secs(30)).await;
+    let game = "stall";
+    let mut a = bridge_for(proxy, "outage_a", "+", game, 2);
+    a.args(["--engine", chu_rules::BUILT_CHUSHOGI_GEN, "--usi-option", "Seed=1"]);
+    let mut b = bridge_for(proxy, "outage_b", "-", game, 2);
+    b.args(["--engine", chu_rules::BUILT_CHUSHOGI_GEN, "--usi-option", "Seed=2"]);
+    let (a, b) = (a.spawn().unwrap(), b.spawn().unwrap());
+    let run = async { tokio::join!(a.wait_with_output(), b.wait_with_output()) };
+    let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(120), run).await.expect("bridges finish");
+    let (a, b) = (a.unwrap(), b.unwrap());
+    let (la, lb) = (String::from_utf8_lossy(&a.stderr), String::from_utf8_lossy(&b.stderr));
+    if std::env::var_os("SHOW_LOGS").is_some() {
+        eprintln!("{la}\n{lb}");
+    }
+    assert!(a.status.success() && b.status.success(), "{la}\n{lb}");
+    for log in [&la, &lb] {
+        assert!(log.contains("no word from the server past the time limit"), "{log}");
+        assert!(log.contains("no login reply"), "{log}");
+        assert!(log.contains("the game ended while disconnected"), "{log}");
+        assert_eq!(log.matches(r#""message":"game over""#).count(), 1, "{log}");
+    }
+}

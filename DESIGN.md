@@ -253,7 +253,8 @@ Translation rules:
 | `bestmove 8i8h` | `+8i8h` to the server; `bestmove resign` → `%TORYO` |
 | Own move echo `+8i8h,T3` | Update the clock model from the server's `T` value, never from local timing |
 | `#…` result lines | `gameover win\|lose\|draw` to the engine, then either the next `%%GAME` or `LOGOUT` |
-| Server unreachable | Reconnect with backoff for up to the remaining clock, re-send `LOGIN` and `%%GAME`, resume from `MOVES:` |
+| Server unreachable | Reconnect with backoff (at most 5 s apart for the remaining clock, then up to 60 s apart, without giving up; only the very first login gives up after 60 s), re-send `LOGIN` and `%%GAME`, resume from `MOVES:` if the game is still running |
+| Server silent | A keep-alive after 60 s of silence, in a game too; no line by the side to move's time limit + 10 s (or AGREE's limit + 10 s) counts as a lost connection, since a socket that only receives never notices a peer gone from the network |
 
 Time safety: the bridge subtracts a configurable margin (default 1 s) from the clock values it sends to the engine, and if the engine has not answered by remaining-time minus 200 ms it sends `stop` and forwards whatever `bestmove` comes back. An engine that answers nothing loses on time by the server's clock, not the bridge's guess.
 
