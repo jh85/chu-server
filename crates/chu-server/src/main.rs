@@ -1,11 +1,16 @@
+use std::fs::OpenOptions;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use chu_rules::Backend;
 use chu_server::{Config, Server};
 use clap::{Parser, ValueEnum};
 use tokio::net::TcpListener;
 use tracing::info;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Copy, Clone, ValueEnum)]
 enum RefereeKind {
@@ -33,18 +38,33 @@ struct Args {
     /// chushogi-gen binary for `--referee subprocess`.
     #[arg(long, default_value = chu_rules::BUILT_CHUSHOGI_GEN)]
     chushogi_gen: PathBuf,
+    /// Also append the log to this file (plain text; the console log stays).
+    #[arg(long)]
+    log_file: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
-        .init();
     let args = Args::parse();
+    let file = match &args.log_file {
+        Some(path) => Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| format!("--log-file {}: {e}", path.display()))?,
+        ),
+        None => None,
+    };
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        // The file first: a line on the console is already in the file.
+        .with(file.map(|f| fmt::layer().with_writer(Mutex::new(f)).with_ansi(false)))
+        .with(fmt::layer().with_writer(std::io::stderr).with_ansi(std::io::stderr().is_terminal()))
+        .init();
+    if let Some(path) = &args.log_file {
+        info!("logging to {} as well", path.display());
+    }
     let referee = match args.referee {
         RefereeKind::Ffi => Backend::Ffi,
         RefereeKind::Subprocess => Backend::Subprocess(args.chushogi_gen),
