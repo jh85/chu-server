@@ -118,14 +118,11 @@ fn nice_step(span: f64, max: usize) -> f64 {
 }
 
 pub fn css() -> &'static str {
-    // Tokens per slot and the chrome, light and dark (both scopes).
+    // Tokens per slot and the chrome: light, dark only with data-theme="dark".
     concat!(
         ".rc{--rc-s1:#2a78d6;--rc-s2:#eb6834;--rc-s3:#1baf7a;--rc-s4:#eda100;--rc-s5:#e87ba4;--rc-s6:#008300;",
-        "--rc-s7:#6250d6;--rc-s8:#e34948;--rc-surface:#fcfcfb;--rc-ink:#0b0b0b;--rc-ink2:#52514e;--rc-muted:#898781;",
+        "--rc-s7:#6250d6;--rc-s8:#e34948;--rc-surface:#ffffff;--rc-ink:#0b0b0b;--rc-ink2:#52514e;--rc-muted:#898781;",
         "--rc-grid:#e1e0d9;--rc-axis:#c3c2b7;font:18px system-ui,-apple-system,\"Segoe UI\",sans-serif}",
-        "@media (prefers-color-scheme:dark){:root:where(:not([data-theme=\"light\"])) .rc{--rc-s1:#3987e5;--rc-s2:#d95926;",
-        "--rc-s3:#199e70;--rc-s4:#c98500;--rc-s5:#d55181;--rc-s6:#008300;--rc-s7:#9085e9;--rc-s8:#e66767;",
-        "--rc-surface:#1a1a19;--rc-ink:#f0efec;--rc-ink2:#c3c2b7;--rc-muted:#898781;--rc-grid:#2c2c2a;--rc-axis:#383835}}",
         ":root[data-theme=\"dark\"] .rc{--rc-s1:#3987e5;--rc-s2:#d95926;--rc-s3:#199e70;--rc-s4:#c98500;--rc-s5:#d55181;",
         "--rc-s6:#008300;--rc-s7:#9085e9;--rc-s8:#e66767;--rc-surface:#1a1a19;--rc-ink:#f0efec;--rc-ink2:#c3c2b7;",
         "--rc-muted:#898781;--rc-grid:#2c2c2a;--rc-axis:#383835}",

@@ -1,8 +1,8 @@
-/* chu-server pages: mobile first, light and dark. */
+/* chu-server pages: mobile first, light. */
 :root {
   color-scheme: light;
-  --page: #f9f9f7;
-  --surface: #fcfcfb;
+  --page: #ffffff;
+  --surface: #f7f7f5;
   --ink: #0b0b0b;
   --ink2: #52514e;
   --muted: #898781;
@@ -13,13 +13,7 @@
   --board-line: #8a6d3b;
   --promoted: #c62828;
 }
-@media (prefers-color-scheme: dark) {
-  :root:where(:not([data-theme="light"])) {
-    color-scheme: dark;
-    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
-    --line: #2c2c2a; --accent: #3987e5; --hot: #6b5a1e; --board: #4a3c22; --board-line: #b39563; --promoted: #ff7a70;
-  }
-}
+/* Always light; dark only on explicit opt-in with data-theme="dark". */
 :root[data-theme="dark"] {
   color-scheme: dark;
   --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
@@ -92,7 +86,6 @@ details.table-view summary { cursor: pointer; color: var(--accent); }
   overflow: hidden; }
 .board .sq.hot { background: var(--hot); }
 .pc { display: inline-block; font-size: clamp(9px, 2.9vw, 16px); line-height: 1; color: #111; }
-@media (prefers-color-scheme: dark) { :root:where(:not([data-theme="light"])) .pc { color: #f4ecd8; } }
 :root[data-theme="dark"] .pc { color: #f4ecd8; }
 .pc.kanji { font-size: clamp(11px, 3.6vw, 20px); }
 .pc.kanji.gote { transform: rotate(180deg); }

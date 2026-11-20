@@ -496,10 +496,7 @@ pub fn player(
                     td { (player_link(if sente { &g.gote } else { &g.sente })) }
                     td { (game_link(&g.id, mine)) " " span.muted.wide { (g.reason.as_deref().map(reason_text).unwrap_or_default()) } }
                     td.num.wide { (g.ply_count) }
-                    td.wide { @if g.ended_at.is_some() {
-                        a href=(format!("/records/{}/game.csa", g.record_dir())) download=(format!("{}.csa", g.id)) { "csa" } " "
-                        a href=(format!("/records/{}/record.json", g.record_dir())) download=(format!("{}.json", g.id)) { "json" }
-                    } }
+                    td.wide { @if g.ended_at.is_some() { (game_link(&g.id, "view")) } }
                 }
             } }
         } }
