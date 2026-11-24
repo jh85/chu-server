@@ -74,9 +74,17 @@ pub struct LeagueConfig {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct File {
+pub struct ConfigFile {
     #[serde(default)]
-    league: Vec<LeagueConfig>,
+    pub server: ServerSettings,
+    #[serde(default)]
+    pub league: Vec<LeagueConfig>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerSettings {
+    pub log_time_zone: Option<chrono_tz::Tz>,
 }
 
 /// A floodgate league's schedule.
@@ -208,7 +216,11 @@ pub struct Startup {
 }
 
 pub fn parse(text: &str) -> Result<Vec<LeagueConfig>, String> {
-    let file: File = toml::from_str(text).map_err(|e| e.to_string())?;
+    parse_config(text).map(|config| config.league)
+}
+
+fn parse_config(text: &str) -> Result<ConfigFile, String> {
+    let file: ConfigFile = toml::from_str(text).map_err(|e| e.to_string())?;
     let mut seen = HashSet::new();
     for l in &file.league {
         l.check()?;
@@ -216,12 +228,16 @@ pub fn parse(text: &str) -> Result<Vec<LeagueConfig>, String> {
             return Err(format!("{}: listed twice", l.name));
         }
     }
-    Ok(file.league)
+    Ok(file)
 }
 
 pub fn load(path: &Path) -> Result<Vec<LeagueConfig>, String> {
+    load_config(path).map(|config| config.league)
+}
+
+pub fn load_config(path: &Path) -> Result<ConfigFile, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    parse_config(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 #[cfg(test)]

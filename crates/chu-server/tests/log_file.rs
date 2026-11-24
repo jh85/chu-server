@@ -7,7 +7,10 @@ use std::process::{Command, Stdio};
 /// Starts the server, waits for "listening on" on its console, then stops it
 /// and returns the console log.
 fn run_once(dir: &std::path::Path, log: &std::path::Path) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_chu-server"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_chu-server"));
+    #[cfg(unix)]
+    command.env("TZ", "EST5");
+    let mut child = command
         .args(["--listen", "127.0.0.1:0", "--http", "127.0.0.1:0"])
         .arg("--db")
         .arg(format!("sqlite://{}", dir.join("chu.db").display()))
@@ -52,9 +55,22 @@ fn log_file_gets_the_log_and_is_appended_to() {
     assert!(first.contains("logging to") && first.contains("league test") && first.contains("listening on"), "{first}");
     assert!(!first.contains('\x1b'), "colour codes in the file: {first:?}");
 
-    run_once(&dir, &log);
+    #[cfg(unix)]
+    for line in console.lines().chain(first.lines()) {
+        let timestamp = line.split_whitespace().next().unwrap();
+        assert!(timestamp.ends_with("-05:00"), "{line}");
+    }
+
+    let config = dir.join("leagues.toml");
+    let leagues = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("[server]\nlog_time_zone = \"Asia/Tokyo\"\n\n{leagues}")).unwrap();
+    let console = run_once(&dir, &log);
     let second = std::fs::read_to_string(&log).unwrap();
     assert!(second.starts_with(&first), "the file was not appended to");
+    for line in console.lines().chain(second[first.len()..].lines()) {
+        let timestamp = line.split_whitespace().next().unwrap();
+        assert!(timestamp.ends_with("+09:00"), "{line}");
+    }
     assert_eq!(second.matches("listening on").count(), 2, "{second}");
 }
 

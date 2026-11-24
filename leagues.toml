@@ -2,6 +2,10 @@
 # any other name is rejected. The name is a label only. Fields: see
 # crates/chu-server/src/league.rs.
 
+[server]
+# Uncomment to override the machine's local time zone for console and file logs.
+# log_time_zone = "America/New_York"
+
 [[league]]
 name = "floodgate-600-10F"
 kind = "floodgate"

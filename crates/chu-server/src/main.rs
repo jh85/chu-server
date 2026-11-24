@@ -5,9 +5,13 @@ use std::sync::Mutex;
 
 use chu_rules::Backend;
 use chu_server::{Config, Server};
+use chrono::{SecondsFormat, Utc};
+use chrono_tz::Tz;
 use clap::{Parser, ValueEnum};
 use tokio::net::TcpListener;
 use tracing::info;
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::{ChronoLocal, FormatTime};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -30,8 +34,8 @@ struct Args {
     db: String,
     #[arg(long, default_value = "records")]
     records: PathBuf,
-    /// The league list: every game the server plays.
-    #[arg(long, default_value = "leagues.toml")]
+    /// The TOML file containing league definitions and server settings.
+    #[arg(long, visible_alias = "config", default_value = "leagues.toml")]
     leagues: PathBuf,
     #[arg(long, value_enum, default_value = "ffi")]
     referee: RefereeKind,
@@ -41,6 +45,25 @@ struct Args {
     /// Also append the log to this file (plain text; the console log stays).
     #[arg(long)]
     log_file: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct LogTimer {
+    time_zone: Option<Tz>,
+    local: ChronoLocal,
+}
+
+impl FormatTime for LogTimer {
+    fn format_time(&self, writer: &mut Writer<'_>) -> std::fmt::Result {
+        match self.time_zone {
+            Some(time_zone) => writer.write_str(
+                &Utc::now()
+                    .with_timezone(&time_zone)
+                    .to_rfc3339_opts(SecondsFormat::AutoSi, false),
+            ),
+            None => self.local.format_time(writer),
+        }
+    }
 }
 
 #[tokio::main]
@@ -56,11 +79,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         None => None,
     };
+    let config = chu_server::league::load_config(&args.leagues)?;
+    let timer = LogTimer {
+        time_zone: config.server.log_time_zone,
+        local: ChronoLocal::rfc_3339(),
+    };
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         // The file first: a line on the console is already in the file.
-        .with(file.map(|f| fmt::layer().with_writer(Mutex::new(f)).with_ansi(false)))
-        .with(fmt::layer().with_writer(std::io::stderr).with_ansi(std::io::stderr().is_terminal()))
+        .with(file.map(|f| {
+            fmt::layer()
+                .with_timer(timer.clone())
+                .with_writer(Mutex::new(f))
+                .with_ansi(false)
+        }))
+        .with(
+            fmt::layer()
+                .with_timer(timer)
+                .with_writer(std::io::stderr)
+                .with_ansi(std::io::stderr().is_terminal()),
+        )
         .init();
     if let Some(path) = &args.log_file {
         info!("logging to {} as well", path.display());
@@ -69,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RefereeKind::Ffi => Backend::Ffi,
         RefereeKind::Subprocess => Backend::Subprocess(args.chushogi_gen),
     };
-    let leagues = chu_server::league::load(&args.leagues)?;
+    let leagues = config.league;
     for l in &leagues {
         let pairing = match l.schedule() {
             Some(s) => format!("every {} min (+{}), cutoff {} s", s.every_min, s.offset_min, s.cutoff_s),
